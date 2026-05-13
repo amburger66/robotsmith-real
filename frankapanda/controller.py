@@ -6,18 +6,13 @@ from deoxys.franka_interface import FrankaInterface
 from deoxys.utils import YamlConfig, transform_utils
 from deoxys.utils.log_utils import get_deoxys_example_logger
 
-# For controlling the Robotiq gripper:
-import pyrobotiqgripper as rq
-
 from robo_utils.conversion_utils import transformation_to_pose
 
 logger = get_deoxys_example_logger()
 
-OPEN = 1
-CLOSED = -1
-
-# Robotiq gripper byte sent to deoxys is unused (gripper driven separately).
-GRIPPER_NOOP = 0.0
+OPEN = -1.0
+CLOSED = 1.0
+FRANKA_GRIPPER_OPEN_THRESHOLD_M = 0.04
 
 
 class FrankaPandaController:
@@ -50,18 +45,8 @@ class FrankaPandaController:
              0.7518,
         ])
 
-        # Robotiq gripper setup
-        self.gripper = rq.RobotiqGripper()
-        self.gripper.activate()
-        self.gripper.calibrate(closemm=0, openmm=40)
-        self.gripper.open()
-
-        # Threshold (mm) used to classify Robotiq state as OPEN vs CLOSED.
-        self._gripper_open_threshold_mm = 20.0
-
-        # Kept for backward compatibility; no longer drive the Franka gripper byte.
-        self.open_gripper_action = 1.0
-        self.close_gripper_action = 0.0
+        self.open_gripper_action = OPEN
+        self.close_gripper_action = CLOSED
 
     def check_joint_position_violation(self):
 
@@ -102,33 +87,37 @@ class FrankaPandaController:
             print("Waiting for robot gripper pose...")
 
     def get_gripper_state(self) -> int:
-        position_mm = self.gripper.position_mm()
-        return OPEN if position_mm >= self._gripper_open_threshold_mm else CLOSED
+        gripper_width = self.robot_interface.last_gripper_q
+        if gripper_width is None:
+            return OPEN if self.robot_interface.last_gripper_action < 0.0 else CLOSED
+        return OPEN if float(gripper_width) >= FRANKA_GRIPPER_OPEN_THRESHOLD_M else CLOSED
 
     def open_gripper(self, num_steps: int = 10):
-        # num_steps kept for signature compatibility; Robotiq blocks until done.
-        del num_steps
-        self.gripper.open()
+        self._command_gripper(self.open_gripper_action, num_steps)
 
     def close_gripper(self, num_steps: int = 10):
-        # num_steps kept for signature compatibility; Robotiq blocks until done.
-        del num_steps
-        self.gripper.close()
+        self._command_gripper(self.close_gripper_action, num_steps)
+
+    def _command_gripper(self, gripper_action: float, num_steps: int = 10):
+        current_joints = self.get_robot_joints()
+        action = np.concatenate([current_joints, [gripper_action]]).tolist()
+        for _ in range(num_steps):
+            self.robot_interface.control(
+                controller_type=self.joint_controller_type,
+                action=action,
+                controller_cfg=self.joint_controller_cfg,
+            )
 
     def move_to_joints(
         self,
         target_joints: np.ndarray,
-        gripper_state: int,
+        gripper_state: int = CLOSED,
         max_iterations: int = 100,
         joint_error_threshold: float = 2e-3,
     ):
 
         assert type(target_joints) == np.ndarray, "Target joints must be a numpy array"
         assert target_joints.shape == (7,), "Target joints must be a 7D array"
-
-        # gripper_state arg retained for API compatibility; Robotiq is driven via
-        # open_gripper/close_gripper. Franka's gripper byte is sent as a no-op.
-        del gripper_state
 
         for _ in range(max_iterations):
 
@@ -138,7 +127,7 @@ class FrankaPandaController:
             if joint_error < joint_error_threshold:
                 break
 
-            action = np.concatenate([target_joints, [GRIPPER_NOOP]])
+            action = np.concatenate([target_joints, [gripper_state]])
             action = action.tolist()
 
             self.robot_interface.control(
@@ -150,7 +139,7 @@ class FrankaPandaController:
     def move_along_trajectory(
         self,
         trajectory: np.ndarray,
-        gripper_state: int,
+        gripper_state: int = CLOSED,
         downsample_factor: int = 10,
         ticks_per_waypoint: int = 50,
         final_threshold: float = 2e-3,
@@ -170,8 +159,8 @@ class FrankaPandaController:
 
         Args:
             trajectory: (N, 7) array of joint positions for each waypoint.
-            gripper_state: Retained for API compatibility; Robotiq gripper is
-                driven separately via open_gripper/close_gripper.
+            gripper_state: Franka gripper action. Negative opens the gripper,
+                non-negative closes it.
             downsample_factor: Keep every Nth waypoint (last waypoint always kept).
             ticks_per_waypoint: Number of control() calls per intermediate waypoint
                 (~ticks_per_waypoint ms at 1kHz FCI rate).
@@ -181,8 +170,6 @@ class FrankaPandaController:
         assert type(trajectory) == np.ndarray, "Trajectory must be a numpy array"
         assert trajectory.ndim == 2 and trajectory.shape[1] == 7, "Trajectory must be an (N, 7) array"
         assert downsample_factor >= 1, "downsample_factor must be >= 1"
-
-        del gripper_state  # Robotiq driven separately; Franka gripper byte unused.
 
         # Downsample, always keeping the final waypoint.
         if downsample_factor > 1 and len(trajectory) > 1:
@@ -195,7 +182,7 @@ class FrankaPandaController:
 
         last_idx = len(sparse) - 1
         for i, target_joints in enumerate(sparse):
-            action = np.concatenate([target_joints, [GRIPPER_NOOP]]).tolist()
+            action = np.concatenate([target_joints, [gripper_state]]).tolist()
 
             if i == last_idx:
                 # Settle to tight tolerance on final waypoint.
@@ -256,9 +243,11 @@ class FrankaPandaController:
             action_pos = np.clip(action_pos, -1.0, 1.0)
             action_axis_angle = np.clip(action_axis_angle, -0.5, 0.5)
 
-            # Combine actions: [pos_x, pos_y, pos_z, rot_x, rot_y, rot_z, gripper]
-            # Gripper byte is a no-op; Robotiq is driven separately.
-            action = action_pos.tolist() + action_axis_angle.tolist() + [GRIPPER_NOOP]
+            action = (
+                action_pos.tolist()
+                + action_axis_angle.tolist()
+                + [self.robot_interface.last_gripper_action]
+            )
             logger.info(f"Axis angle action {action_axis_angle.tolist()}")
 
             self.robot_interface.control(

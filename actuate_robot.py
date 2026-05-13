@@ -1,7 +1,9 @@
 import numpy as np
-import pyrobotiqgripper as rq
 from deoxys.franka_interface import FrankaInterface
 from deoxys.utils import YamlConfig
+
+OPEN_GRIPPER = -1.0
+CLOSE_GRIPPER = 1.0
 
 config_path = "configs"
 
@@ -15,11 +17,6 @@ controller_cfg = YamlConfig(
     f"{config_path}/joint-position-controller.yml"
 ).as_easydict()
 
-gripper = rq.RobotiqGripper()
-gripper.activate()
-gripper.calibrate(closemm=0, openmm=40)
-gripper.open()
-
 # These are home joints:
 target_joint_positions = [
     -1.3159,
@@ -31,8 +28,6 @@ target_joint_positions = [
      0.7518,
 ]
 
-action = target_joint_positions + [0.0]    # Franka gripper byte unused; Robotiq driven separately
-
 while True:
 
     if len(robot_interface._state_buffer) > 0:
@@ -42,10 +37,15 @@ while True:
 
     robot_interface.control(
         controller_type=controller_type,
-        action=action,
+        action=target_joint_positions + [OPEN_GRIPPER],
         controller_cfg=controller_cfg,
     )
 
-gripper.close()
+for _ in range(10):
+    robot_interface.control(
+        controller_type=controller_type,
+        action=target_joint_positions + [CLOSE_GRIPPER],
+        controller_cfg=controller_cfg,
+    )
 
 robot_interface.close()

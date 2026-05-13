@@ -1,6 +1,3 @@
 [submodule "robo_utils"]
 	path = robo_utils
 	url = git@github.com:kallol-saha/robo-utils.git
-[submodule "pyRobotiqGripper"]
-	path = pyRobotiqGripper
-	url = git@github.com:castetsb/pyRobotiqGripper.git
