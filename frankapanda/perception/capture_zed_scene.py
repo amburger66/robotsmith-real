@@ -18,6 +18,12 @@ def main():
     parser.add_argument("--out_dir", type=str, default="data/zed_captures")
     parser.add_argument("--resolution", type=str, default="HD720")
     parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument(
+        "--coordinate-system",
+        choices=["IMAGE", "RIGHT_HANDED_Z_UP"],
+        default="IMAGE",
+        help="ZED XYZ coordinate system. IMAGE matches the OpenCV camera frame used by calibration.",
+    )
     args = parser.parse_args()
 
     resolution_map = {
@@ -33,7 +39,7 @@ def main():
     init_params.camera_fps = args.fps
     init_params.depth_mode = sl.DEPTH_MODE.NEURAL
     init_params.coordinate_units = sl.UNIT.METER
-    init_params.coordinate_system = sl.COORDINATE_SYSTEM.RIGHT_HANDED_Z_UP
+    init_params.coordinate_system = getattr(sl.COORDINATE_SYSTEM, args.coordinate_system)
 
     # For multiple ZEDs, this selects by camera index.
     init_params.set_from_camera_id(args.camera_id)
@@ -90,12 +96,14 @@ def main():
     np.save(out_dir / "depth_m.npy", depth_m)
     np.save(out_dir / "xyz_m.npy", xyz)
     np.savez(out_dir / "camera_intrinsics.npz", **intrinsics)
+    (out_dir / "coordinate_system.txt").write_text(args.coordinate_system + "\n")
 
     print(f"Saved ZED observation to: {out_dir}")
     print(f"RGB:   {rgb.shape}")
     print(f"Depth: {depth_m.shape}, meters")
     print(f"XYZ:   {xyz.shape}, meters")
     print(f"Intrinsics: {intrinsics}")
+    print(f"Coordinate system: {args.coordinate_system}")
 
     zed.close()
 

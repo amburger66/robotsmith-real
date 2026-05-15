@@ -25,6 +25,8 @@ from PIL import Image, ImageDraw, ImageFont
 
 
 ROBOTSMITH_ROOT = Path(__file__).resolve().parents[1]
+WORKSPACE_ROOT = ROBOTSMITH_ROOT.parent
+DATA_ROOT = WORKSPACE_ROOT / "data"
 # Let this script run both from the repository root and after editable installs.
 for path in (ROBOTSMITH_ROOT, ROBOTSMITH_ROOT / "robo_utils"):
     path_str = str(path)
@@ -32,9 +34,9 @@ for path in (ROBOTSMITH_ROOT, ROBOTSMITH_ROOT / "robo_utils"):
         sys.path.insert(0, path_str)
 
 
-DEFAULT_SCENE_DIR = ROBOTSMITH_ROOT / "data/task08_cutting/vlm_traj_queries/cutter"
-DEFAULT_EXTRINSICS = ROBOTSMITH_ROOT / "data/calibration/eye_to_hand/cam0_calibration.npz"
-DEFAULT_ZED_ROOT = ROBOTSMITH_ROOT / "data/zed_captures"
+DEFAULT_SCENE_DIR = DATA_ROOT / "task08_cutting/vlm_traj_queries/cutter"
+DEFAULT_EXTRINSICS = DATA_ROOT / "calibration/eye_to_hand/cam0_calibration.npz"
+DEFAULT_ZED_ROOT = DATA_ROOT / "zed_captures"
 DEFAULT_CROP = (380, 1000, 0, 620)
 DEFAULT_GRIPPER_QUAT_WXYZ = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
@@ -61,7 +63,7 @@ class TargetRecord:
     planning_success: bool | None = None
 
 
-def resolve_path(path: str | os.PathLike, *, base: Path = ROBOTSMITH_ROOT) -> Path:
+def resolve_path(path: str | os.PathLike, *, base: Path = WORKSPACE_ROOT) -> Path:
     p = Path(path).expanduser()
     if p.is_absolute():
         return p
@@ -171,7 +173,9 @@ def crop_resize_zed_capture(capture_dir: Path, crop: tuple[int, int, int, int], 
         "width": int(size),
         "height": int(size),
     }
-    return rgb_256, depth_256, xyz_256, intr
+    coord_file = capture_dir / "coordinate_system.txt"
+    coordinate_system = coord_file.read_text().strip() if coord_file.is_file() else "unknown"
+    return rgb_256, depth_256, xyz_256, intr, coordinate_system
 
 
 def load_extrinsics_matrix(extrinsics_path: Path) -> np.ndarray:
@@ -505,6 +509,7 @@ def save_records_json(
         "crop": list(args.crop),
         "size": int(args.size),
         "intrinsics_after_crop_resize": intr,
+        "zed_coordinate_system": getattr(args, "zed_coordinate_system", "unknown"),
         "gripper_quat_wxyz": args.gripper_quat.tolist(),
         "finger_tip_offset": float(args.finger_tip_offset),
         "ignore_xyz_offsets": bool(args.ignore_xyz_offsets),
@@ -703,7 +708,19 @@ def main() -> int:
     print(f"Mode:       {'EXECUTE' if args.execute else 'DRY RUN'}")
 
     plan = load_plan(plan_file)
-    rgb_256, depth_256, xyz_256, intr = crop_resize_zed_capture(zed_capture_dir, args.crop, args.size)
+    rgb_256, depth_256, xyz_256, intr, zed_coordinate_system = crop_resize_zed_capture(zed_capture_dir, args.crop, args.size)
+    args.zed_coordinate_system = zed_coordinate_system
+    if zed_coordinate_system == "unknown":
+        print(
+            "WARNING: ZED capture has no coordinate_system.txt metadata. "
+            "Old captures from capture_zed_scene.py may have used RIGHT_HANDED_Z_UP, "
+            "while calibration expects OpenCV/ZED IMAGE camera coordinates."
+        )
+    elif zed_coordinate_system != "IMAGE":
+        print(
+            f"WARNING: ZED capture coordinate system is {zed_coordinate_system!r}; "
+            "calibration expects OpenCV/ZED IMAGE camera coordinates."
+        )
     T_cam_to_base = resolve_camera_to_base(extrinsics, args.extrinsics_direction)
     targets = build_targets(plan, depth_256, xyz_256, intr, T_cam_to_base, args.gripper_quat, args)
     print_target_summary(targets)
