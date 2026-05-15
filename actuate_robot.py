@@ -18,15 +18,7 @@ controller_cfg = YamlConfig(
 ).as_easydict()
 
 # These are home joints:
-target_joint_positions = [
-    -1.3159,
-    -0.4246,
-     0.1067,
-    -2.7110,
-    -0.0562,
-     2.3219,
-     0.7518,
-]
+target_joint_positions = [0, -0.785, 0, -2.356, 0, 1.571, 0.785]
 
 while True:
 

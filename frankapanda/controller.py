@@ -1,5 +1,6 @@
 import numpy as np
 import time
+from pathlib import Path
 
 # For controlling the Franka:
 from deoxys.franka_interface import FrankaInterface
@@ -13,6 +14,7 @@ logger = get_deoxys_example_logger()
 OPEN = -1.0
 CLOSED = 1.0
 FRANKA_GRIPPER_OPEN_THRESHOLD_M = 0.04
+CONFIG_ROOT = Path(__file__).resolve().parents[1] / "configs"
 
 
 class FrankaPandaController:
@@ -20,30 +22,22 @@ class FrankaPandaController:
     def __init__(self):
 
         self.robot_interface = FrankaInterface(
-            "configs/charmander.yml",
+            str(CONFIG_ROOT / "charmander.yml"),
             use_visualizer=False
         )
 
         self.joint_controller_cfg = YamlConfig(
-            "configs/joint-position-controller.yml"
+            str(CONFIG_ROOT / "joint-position-controller.yml")
         ).as_easydict()
         self.joint_controller_type = "JOINT_POSITION"
 
         self.osc_controller_cfg = YamlConfig(
-            "configs/tuned-osc-yaw-controller.yml"
+            str(CONFIG_ROOT / "tuned-osc-yaw-controller.yml")
         ).as_easydict()
         self.osc_controller_type = "OSC_POSE"
 
         # Changed to this for shelf packing
-        self.home_joints = np.array([
-            -1.3159,
-            -0.4246,
-             0.1067,
-            -2.7110,
-            -0.0562,
-             2.3219,
-             0.7518,
-        ])
+        self.home_joints = np.array([0, -0.785, 0, -2.356, 0, 1.571, 0.785])
 
         self.open_gripper_action = OPEN
         self.close_gripper_action = CLOSED
