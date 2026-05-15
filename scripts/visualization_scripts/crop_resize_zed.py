@@ -5,9 +5,8 @@ the input directory, applies the same square crop to all of them, resizes to
 256x256, updates the intrinsics for the crop+resize, and writes everything to
 an output directory (default: <input>_256).
 
-Defaults crop to a 720x720 square pulled from the right side of the 1280x720
-frame so the robot arm, cutting tool, and playdough block all fit. Override
-with --x0/--x1/--y0/--y1 if you want a different window.
+Defaults crop to the 620x620 square used for VLM query images
+(x=380:1000, y=0:620). Override with --x0/--x1/--y0/--y1 if you want a different window.
 """
 from __future__ import annotations
 
@@ -31,10 +30,10 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Where to write cropped+resized outputs (default: <input-dir>_256)",
     )
-    p.add_argument("--x0", type=int, default=560)
-    p.add_argument("--x1", type=int, default=1280)
+    p.add_argument("--x0", type=int, default=380)
+    p.add_argument("--x1", type=int, default=1000)
     p.add_argument("--y0", type=int, default=0)
-    p.add_argument("--y1", type=int, default=720)
+    p.add_argument("--y1", type=int, default=620)
     p.add_argument("--size", type=int, default=256)
     return p.parse_args()
 
