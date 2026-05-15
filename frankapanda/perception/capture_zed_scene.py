@@ -14,7 +14,7 @@ def sl_mat_to_numpy(mat: sl.Mat) -> np.ndarray:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--camera_id", type=int, default=0)
+    parser.add_argument("--camera_id", type=int, default=1)
     parser.add_argument("--out_dir", type=str, default="data/zed_captures")
     parser.add_argument("--resolution", type=str, default="HD720")
     parser.add_argument("--fps", type=int, default=30)
