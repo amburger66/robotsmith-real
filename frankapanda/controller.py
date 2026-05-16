@@ -36,7 +36,6 @@ class FrankaPandaController:
         ).as_easydict()
         self.osc_controller_type = "OSC_POSE"
 
-        # Changed to this for shelf packing
         self.home_joints = np.array([0, -0.785, 0, -2.356, 0, 1.571, 0.785])
 
         self.open_gripper_action = OPEN
@@ -52,8 +51,8 @@ class FrankaPandaController:
         while True:
             if len(self.robot_interface._state_buffer) > 0:
                 robot_joints = self.robot_interface._state_buffer[-1].q
-                if self.check_joint_position_violation():
-                    print("Joint position violation detected!")
+                # if self.check_joint_position_violation():
+                #     print("Joint position violation detected!")
                 return np.array(robot_joints)
             print("Waiting for robot joints...")
 
@@ -63,8 +62,8 @@ class FrankaPandaController:
                 joint_positions = self.robot_interface._state_buffer[-1].q
                 gripper_state = self.get_gripper_state()
                 qpos = np.concatenate([joint_positions, [gripper_state]])
-                if self.check_joint_position_violation():
-                    print("Joint position violation detected!")
+                # if self.check_joint_position_violation():
+                #     print("Joint position violation detected!")
                 return qpos
             print("Waiting for robot qpos...")
 
@@ -73,8 +72,8 @@ class FrankaPandaController:
             if len(self.robot_interface._state_buffer) > 0:
                 gripper_pose = self.robot_interface._state_buffer[-1].O_T_EE
                 gripper_pose = np.array(gripper_pose).reshape(4, 4).T
-                if self.check_joint_position_violation():
-                    print("Joint position violation detected!")
+                # if self.check_joint_position_violation():
+                #     print("Joint position violation detected!")
                 if not as_transform:
                     gripper_pose = transformation_to_pose(gripper_pose, format=format)
                 return gripper_pose

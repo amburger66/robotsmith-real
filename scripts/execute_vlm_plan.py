@@ -33,12 +33,14 @@ for path in (ROBOTSMITH_ROOT, ROBOTSMITH_ROOT / "robo_utils"):
     if path_str not in sys.path:
         sys.path.insert(0, path_str)
 
+from frankapanda.motionplanner import EE_LINK_CENTER_TO_GRIPPER_TIP
+
 
 DEFAULT_SCENE_DIR = DATA_ROOT / "task08_cutting/vlm_traj_queries/cutter"
 DEFAULT_EXTRINSICS = DATA_ROOT / "calibration/eye_to_hand/cam0_calibration.npz"
 DEFAULT_ZED_ROOT = DATA_ROOT / "zed_captures"
 DEFAULT_CROP = (380, 1000, 0, 620)
-DEFAULT_GRIPPER_QUAT_WXYZ = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+DEFAULT_GRIPPER_QUAT_WXYZ = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32)
 
 GRIPPER_CLOSE = 0
 GRIPPER_OPEN = 1
@@ -52,13 +54,12 @@ class TargetRecord:
     offset_robot_m: list[float]
     camera_point_m: list[float] | None
     base_anchor_m: list[float] | None
-    target_position_unclipped_m: list[float] | None
     target_position_m: list[float] | None
     target_pose_wxyz: list[float] | None
     gripper_action: int
-    clipped_delta_m: float
     used_fallback_backprojection: bool
     valid: bool
+    z_clipped_for_grip: bool = False
     error: str | None = None
     planning_success: bool | None = None
 
@@ -193,15 +194,6 @@ def load_extrinsics_matrix(extrinsics_path: Path) -> np.ndarray:
     return T
 
 
-def resolve_camera_to_base(extrinsics_path: Path, extrinsics_direction: str) -> np.ndarray:
-    T = load_extrinsics_matrix(extrinsics_path)
-    if extrinsics_direction == "camera_to_base":
-        return T
-    if extrinsics_direction == "base_to_camera":
-        return np.linalg.inv(T)
-    raise ValueError(f"Unsupported extrinsics direction: {extrinsics_direction}")
-
-
 def transform_points(points: np.ndarray, T: np.ndarray) -> np.ndarray:
     points = np.asarray(points, dtype=np.float64)
     flat = points.reshape(-1, 3)
@@ -219,15 +211,6 @@ def fallback_backproject(u: int, v: int, depth: np.ndarray, intr: dict[str, floa
     return np.array([x, y, z], dtype=np.float32)
 
 
-def clip_position(position: np.ndarray, args: argparse.Namespace) -> tuple[np.ndarray, float]:
-    if not args.clip_targets:
-        return position.copy(), 0.0
-    lower = np.array([args.workspace_x[0], args.workspace_y[0], args.workspace_z[0]], dtype=np.float64)
-    upper = np.array([args.workspace_x[1], args.workspace_y[1], args.workspace_z[1]], dtype=np.float64)
-    clipped = np.clip(position, lower, upper)
-    return clipped, float(np.linalg.norm(clipped - position))
-
-
 def build_targets(
     plan: list[list[float]],
     depth: np.ndarray,
@@ -239,6 +222,8 @@ def build_targets(
 ) -> list[TargetRecord]:
     H, W = depth.shape
     targets: list[TargetRecord] = []
+    gripping_tool = False
+    grip_z_floor_m: float | None = None
 
     for i, waypoint in enumerate(plan):
         x_norm, y_norm, dx, dy, dz, gripper_action = waypoint
@@ -255,11 +240,9 @@ def build_targets(
                     offset_robot_m=[float(dx), float(dy), float(dz)],
                     camera_point_m=None,
                     base_anchor_m=None,
-                    target_position_unclipped_m=None,
                     target_position_m=None,
                     target_pose_wxyz=None,
                     gripper_action=action,
-                    clipped_delta_m=0.0,
                     used_fallback_backprojection=False,
                     valid=False,
                     error=f"Unsupported gripper action {action}; expected 0 close or 1 open",
@@ -281,11 +264,9 @@ def build_targets(
                         offset_robot_m=[float(dx), float(dy), float(dz)],
                         camera_point_m=None,
                         base_anchor_m=None,
-                        target_position_unclipped_m=None,
                         target_position_m=None,
                         target_pose_wxyz=None,
                         gripper_action=action,
-                        clipped_delta_m=0.0,
                         used_fallback_backprojection=True,
                         valid=False,
                         error=f"Invalid depth/xyz at pixel {(u, v)}",
@@ -299,10 +280,15 @@ def build_targets(
         offset = np.zeros(3, dtype=np.float64) if (args.ignore_xyz_offsets or args.anchor_points_only) else plan_offset
         target_position = base_anchor + offset
         if not args.anchor_points_only:
-            target_position[2] += float(args.finger_tip_offset)
-        target_position_clipped, clipped_delta = clip_position(target_position, args)
+            target_position[2] += float(EE_LINK_CENTER_TO_GRIPPER_TIP)
 
-        pose = np.concatenate([target_position_clipped, gripper_quat.astype(np.float64)])
+        z_clipped = False
+        if gripping_tool and grip_z_floor_m is not None:
+            clipped_z = max(target_position[2], grip_z_floor_m)
+            z_clipped = bool(clipped_z > target_position[2] + 1e-9)
+            target_position[2] = clipped_z
+
+        pose = np.concatenate([target_position, gripper_quat.astype(np.float64)])
         targets.append(
             TargetRecord(
                 index=i,
@@ -311,16 +297,23 @@ def build_targets(
                 offset_robot_m=plan_offset.tolist(),
                 camera_point_m=camera_point.tolist(),
                 base_anchor_m=base_anchor.tolist(),
-                target_position_unclipped_m=target_position.tolist(),
-                target_position_m=target_position_clipped.tolist(),
+                target_position_m=target_position.tolist(),
                 target_pose_wxyz=pose.tolist(),
                 gripper_action=action,
-                clipped_delta_m=clipped_delta,
                 used_fallback_backprojection=used_fallback,
+                z_clipped_for_grip=z_clipped,
                 valid=True,
                 error=None,
             )
         )
+
+        if action == GRIPPER_CLOSE:
+            gripping_tool = True
+            grip_z_floor_m = float(target_position[2])
+            print("setting grip_z_floor_m to ", grip_z_floor_m)
+        elif action == GRIPPER_OPEN:
+            gripping_tool = False
+            grip_z_floor_m = None
 
     return targets
 
@@ -505,37 +498,18 @@ def save_records_json(
         "plan_file": str(plan_file),
         "zed_capture_dir": str(zed_capture_dir),
         "extrinsics": str(extrinsics),
-        "extrinsics_direction": args.extrinsics_direction,
         "crop": list(args.crop),
         "size": int(args.size),
         "intrinsics_after_crop_resize": intr,
         "zed_coordinate_system": getattr(args, "zed_coordinate_system", "unknown"),
         "gripper_quat_wxyz": args.gripper_quat.tolist(),
-        "finger_tip_offset": float(args.finger_tip_offset),
+        "ee_link_center_to_gripper_tip": float(EE_LINK_CENTER_TO_GRIPPER_TIP),
         "ignore_xyz_offsets": bool(args.ignore_xyz_offsets),
         "anchor_points_only": bool(args.anchor_points_only),
-        "clip_targets": bool(args.clip_targets),
-        "workspace_bounds": {
-            "x": list(args.workspace_x),
-            "y": list(args.workspace_y),
-            "z": list(args.workspace_z),
-        },
         "targets": [asdict(t) for t in targets],
     }
     with path.open("w") as f:
         json.dump(payload, f, indent=2)
-
-
-def choose_plan_config(motion_planner, start_pose: np.ndarray | None, goal_pose: np.ndarray):
-    if start_pose is None:
-        return None
-    delta = goal_pose[:3] - start_pose[:3]
-    abs_delta = np.abs(delta)
-    if abs_delta[2] > 0.03 and abs_delta[2] >= 2.0 * max(abs_delta[0], abs_delta[1], 1e-6):
-        return motion_planner.lift_plan_config
-    if max(abs_delta[0], abs_delta[1]) > 0.03 and abs_delta[2] < 0.03:
-        return motion_planner.only_xy_translation_plan_config
-    return None
 
 
 def plan_segments(
@@ -557,49 +531,41 @@ def plan_segments(
     current_joints = torch.tensor(current_joints_np, dtype=torch.float32, device=args.torch_device)
     motion_planner = MotionPlanner(scene_points)
 
+    # motion_planner.visualize_world_and_robot(current_joints)
+
     trajectories = []
-    prev_pose = None
     for target in targets:
+        print("Planning target: ", target.index)
         if not target.valid or target.target_pose_wxyz is None:
             target.planning_success = False
             continue
 
         goal_pose_np = np.asarray(target.target_pose_wxyz, dtype=np.float32)
         goal_pose = torch.tensor(goal_pose_np, dtype=torch.float32, device=args.torch_device)
-        plan_config = choose_plan_config(motion_planner, prev_pose, goal_pose_np)
-        plan_kwargs = {}
-        if plan_config is not None:
-            plan_kwargs["plan_config"] = plan_config
+
+        if args.dry_run:
+            motion_planner.visualize_world_and_robot(current_joints, goal_pose)
 
         # Allow the hand/fingers to occupy the target contact region while still
         # checking the rest of the arm against the ZED collision cloud.
-        plan_kwargs["disable_collision_links"] = motion_planner.links[-5:]
-
         traj, success = motion_planner.plan_to_goal_poses(
             current_joints=current_joints.unsqueeze(0),
             goal_poses=goal_pose.unsqueeze(0),
-            **plan_kwargs,
+            plan_config=motion_planner.fixed_gripper_orientation_plan_config,
+            disable_collision_links=motion_planner.links[-5:],
         )
+        print("Planning success: ", success.item())
         target.planning_success = bool(success.item())
         if not target.planning_success:
-            trajectories.append(None)
-            continue
+            break
 
         trajectories.append(traj[0].detach().cpu().numpy())
         current_joints = traj[0, -1].detach()
-        prev_pose = goal_pose_np
 
     all_success = all(t.valid and bool(t.planning_success) for t in targets)
     if not all_success:
         failed = [t.index for t in targets if not (t.valid and bool(t.planning_success))]
         raise RuntimeError(f"Planning failed for target indices: {failed}")
-
-    clipped = [t.index for t in targets if t.clipped_delta_m > args.clip_tolerance_m]
-    if args.clip_targets and clipped and not args.allow_clipped_targets:
-        raise RuntimeError(
-            f"Targets clipped by more than {args.clip_tolerance_m:.3f} m: {clipped}. "
-            "Inspect dry-run output or pass --allow-clipped-targets."
-        )
 
     if not execute:
         return trajectories
@@ -623,12 +589,12 @@ def print_target_summary(targets: list[TargetRecord]) -> None:
             print(f"  [{t.index}] INVALID pixel={t.source_pixel} action={t.gripper_action}: {t.error}")
             continue
         pos = np.asarray(t.target_position_m)
-        clip = f", clipped {t.clipped_delta_m:.3f} m" if t.clipped_delta_m > 1e-6 else ""
         fallback = ", fallback-depth" if t.used_fallback_backprojection else ""
+        clipped = ", z-clipped (gripping)" if t.z_clipped_for_grip else ""
         print(
             f"  [{t.index}] pixel={t.source_pixel} "
             f"target=[{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}] "
-            f"action={t.gripper_action}{clip}{fallback}"
+            f"action={t.gripper_action}{fallback}{clipped}"
         )
 
 
@@ -639,12 +605,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plan-file", default=None)
     parser.add_argument("--zed-capture-dir", default=None)
     parser.add_argument("--extrinsics", default=str(DEFAULT_EXTRINSICS))
-    parser.add_argument(
-        "--extrinsics-direction",
-        choices=("base_to_camera", "camera_to_base"),
-        default="camera_to_base",
-        help="Frame direction of the matrix stored in --extrinsics. Default matches cam1_calibration.npz.",
-    )
     parser.add_argument("--crop", nargs=4, type=int, default=list(DEFAULT_CROP), metavar=("X0", "X1", "Y0", "Y1"))
     parser.add_argument("--size", type=int, default=256)
     parser.add_argument("--execute", action="store_true", help="Move the real robot after a successful dry-run/planning pass.")
@@ -652,27 +612,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vis-dir", default=None)
     parser.add_argument("--show-vis", action="store_true")
     parser.add_argument("--gripper-quat", type=parse_quat, default=DEFAULT_GRIPPER_QUAT_WXYZ)
-    parser.add_argument("--finger-tip-offset", type=float, default=0.08)
     parser.add_argument(
         "--ignore-xyz-offsets",
         action="store_true",
-        help="Debug mode: ignore VLM dx/dy/dz offsets but still apply --finger-tip-offset.",
+        help="Debug mode: ignore VLM dx/dy/dz offsets but still apply the gripper-tip offset.",
     )
     parser.add_argument(
         "--anchor-points-only",
         action="store_true",
-        help="Debug mode: use raw backprojected VLM anchor points only; ignores dx/dy/dz and --finger-tip-offset.",
-    )
-    parser.add_argument("--workspace-x", nargs=2, type=float, default=[0.15, 0.85])
-    parser.add_argument("--workspace-y", nargs=2, type=float, default=[-0.60, 0.60])
-    parser.add_argument("--workspace-z", nargs=2, type=float, default=[0.02, 0.70])
-    parser.add_argument("--clip-tolerance-m", type=float, default=0.02)
-    parser.add_argument("--allow-clipped-targets", action="store_true")
-    parser.add_argument(
-        "--clip-targets",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Clip projected targets to workspace bounds. Use --no-clip-targets to keep raw projected targets.",
+        help="Debug mode: use raw backprojected VLM anchor points only; ignores dx/dy/dz and the gripper-tip offset.",
     )
     parser.add_argument("--max-camera-distance-m", type=float, default=1.5)
     parser.add_argument("--max-planning-points", type=int, default=12000)
@@ -703,7 +651,7 @@ def main() -> int:
 
     print(f"Plan:       {plan_file}")
     print(f"ZED:        {zed_capture_dir}")
-    print(f"Extrinsics: {extrinsics} ({args.extrinsics_direction})")
+    print(f"Extrinsics: {extrinsics} (camera_to_base)")
     print(f"Vis dir:    {vis_dir}")
     print(f"Mode:       {'EXECUTE' if args.execute else 'DRY RUN'}")
 
@@ -721,7 +669,7 @@ def main() -> int:
             f"WARNING: ZED capture coordinate system is {zed_coordinate_system!r}; "
             "calibration expects OpenCV/ZED IMAGE camera coordinates."
         )
-    T_cam_to_base = resolve_camera_to_base(extrinsics, args.extrinsics_direction)
+    T_cam_to_base = load_extrinsics_matrix(extrinsics)
     targets = build_targets(plan, depth_256, xyz_256, intr, T_cam_to_base, args.gripper_quat, args)
     print_target_summary(targets)
 
@@ -740,14 +688,6 @@ def main() -> int:
     if invalid:
         save_records_json(vis_dir / "targets_3d.json", args, plan_file, zed_capture_dir, extrinsics, intr, targets)
         raise RuntimeError(f"Invalid targets: {invalid}. See {vis_dir / 'targets_3d.json'}")
-
-    clipped = [t.index for t in targets if t.clipped_delta_m > args.clip_tolerance_m]
-    if args.clip_targets and clipped and not args.allow_clipped_targets:
-        save_records_json(vis_dir / "targets_3d.json", args, plan_file, zed_capture_dir, extrinsics, intr, targets)
-        raise RuntimeError(
-            f"Targets clipped by more than {args.clip_tolerance_m:.3f} m: {clipped}. "
-            f"See {vis_dir / 'targets_3d.json'}"
-        )
 
     try:
         if not args.skip_planning:
