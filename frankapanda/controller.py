@@ -54,7 +54,7 @@ class FrankaPandaController:
                 # if self.check_joint_position_violation():
                 #     print("Joint position violation detected!")
                 return np.array(robot_joints)
-            print("Waiting for robot joints...")
+            # print("Waiting for robot joints...")
 
     def get_qpos(self) -> np.ndarray:
         while True:
@@ -65,7 +65,7 @@ class FrankaPandaController:
                 # if self.check_joint_position_violation():
                 #     print("Joint position violation detected!")
                 return qpos
-            print("Waiting for robot qpos...")
+            # print("Waiting for robot qpos...")
 
     def get_gripper_pose(self, as_transform=False, format='wxyz') -> np.ndarray:
         while True:
@@ -77,7 +77,7 @@ class FrankaPandaController:
                 if not as_transform:
                     gripper_pose = transformation_to_pose(gripper_pose, format=format)
                 return gripper_pose
-            print("Waiting for robot gripper pose...")
+            # print("Waiting for robot gripper pose...")
 
     def get_gripper_state(self) -> int:
         gripper_width = self.robot_interface.last_gripper_q
