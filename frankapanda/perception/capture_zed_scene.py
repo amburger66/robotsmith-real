@@ -91,9 +91,9 @@ def main():
     out_dir = Path(args.out_dir) / f"zed{args.camera_id}_{timestamp}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    cv2.imwrite(str(out_dir / "rgb.png"), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+    cv2.imwrite(str(out_dir / "initial.png"), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
     np.save(out_dir / "rgb.npy", rgb)
-    np.save(out_dir / "depth_m.npy", depth_m)
+    np.save(out_dir / "initial_depth.npy", depth_m)
     np.save(out_dir / "xyz_m.npy", xyz)
     np.savez(out_dir / "camera_intrinsics.npz", **intrinsics)
     (out_dir / "coordinate_system.txt").write_text(args.coordinate_system + "\n")
