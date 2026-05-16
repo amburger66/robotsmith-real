@@ -36,9 +36,17 @@ for path in (ROBOTSMITH_ROOT, ROBOTSMITH_ROOT / "robo_utils"):
 from frankapanda.motionplanner import EE_LINK_CENTER_TO_GRIPPER_TIP
 
 
-DEFAULT_SCENE_DIR = DATA_ROOT / "task08_cutting/vlm_traj_queries/cutter"
+TASK_TO_TOOL = {
+    "task08_cutting": "cutter",
+    "task03_flatten": "paddle",
+}
+DEFAULT_TASK_NAME = "task08_cutting"
 DEFAULT_EXTRINSICS = DATA_ROOT / "calibration/eye_to_hand/cam0_calibration.npz"
-DEFAULT_ZED_ROOT = DATA_ROOT / "zed_captures"
+ZED_CAPTURE_DIR = {
+    "task08_cutting": "data/zed_captures/zed1_20260515_131532",
+    "task03_flatten": "data/zed_captures/zed1_20260516_154329",
+}
+
 DEFAULT_CROP = (380, 1000, 0, 620)
 DEFAULT_GRIPPER_QUAT_WXYZ = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32)
 
@@ -74,6 +82,28 @@ def resolve_path(path: str | os.PathLike, *, base: Path = WORKSPACE_ROOT) -> Pat
     return (base / p).resolve()
 
 
+def task_tool(task_name: str) -> str:
+    try:
+        return TASK_TO_TOOL[task_name]
+    except KeyError as exc:
+        supported = ", ".join(sorted(TASK_TO_TOOL))
+        raise ValueError(f"Unsupported task_name {task_name!r}; expected one of: {supported}") from exc
+
+
+def default_scene_dir(task_name: str) -> Path:
+    return DATA_ROOT / task_name / "vlm_traj_queries" / task_tool(task_name)
+
+
+def default_episode_dir(task_name: str) -> Path:
+    return DATA_ROOT / "real_world_episodes_wm" / task_name / task_tool(task_name)
+
+
+def default_zed_capture_dir(task_name: str) -> Path:
+    capture = ZED_CAPTURE_DIR.get(task_name)
+    if not capture:
+        raise ValueError(f"ZED_CAPTURE_DIR[{task_name!r}] is not configured")
+    return resolve_path(capture)
+
 def parse_quat(raw: str) -> np.ndarray:
     values = [float(v.strip()) for v in raw.split(",")]
     if len(values) != 4:
@@ -83,25 +113,6 @@ def parse_quat(raw: str) -> np.ndarray:
     if not np.isfinite(norm) or norm < 1e-8:
         raise argparse.ArgumentTypeError("--gripper-quat must be a nonzero quaternion")
     return quat / norm
-
-
-def latest_zed_capture(root: Path = DEFAULT_ZED_ROOT) -> Path:
-    if not root.exists():
-        raise FileNotFoundError(f"ZED capture root does not exist: {root}")
-    candidates = sorted(
-        p
-        for p in root.iterdir()
-        if p.is_dir()
-        and p.name.startswith("zed")
-        and not p.name.endswith("_256")
-        and (p / "rgb.npy").is_file()
-        and (p / "depth_m.npy").is_file()
-        and (p / "xyz_m.npy").is_file()
-        and (p / "camera_intrinsics.npz").is_file()
-    )
-    if not candidates:
-        raise FileNotFoundError(f"No unpacked ZED capture directories found under {root}")
-    return candidates[-1]
 
 
 def load_plan(plan_file: Path) -> list[list[float]]:
@@ -120,7 +131,7 @@ def load_plan(plan_file: Path) -> list[list[float]]:
 def resolve_plan_file(args: argparse.Namespace) -> Path:
     if args.plan_file is not None:
         return resolve_path(args.plan_file)
-    scene_dir = resolve_path(args.scene_dir)
+    scene_dir = resolve_path(args.scene_dir) if args.scene_dir is not None else default_scene_dir(args.task_name)
     if args.plan_id is None:
         raise ValueError("Provide --plan-id or --plan-file")
     return scene_dir / args.plan_id / "initial_0_robot.json"
@@ -136,6 +147,43 @@ def resize_float_array(arr: np.ndarray, size: int) -> np.ndarray:
         ]
         return np.stack(channels, axis=-1)
     raise ValueError(f"Expected 2D or 3D float array, got shape {arr.shape}")
+
+
+def crop_resize_rgb_array(rgb: np.ndarray, crop: tuple[int, int, int, int], size: int) -> np.ndarray:
+    x0, x1, y0, y1 = crop
+    if rgb.ndim != 3 or rgb.shape[-1] != 3:
+        raise ValueError(f"Expected RGB image with shape HxWx3, got {rgb.shape}")
+    H, W = rgb.shape[:2]
+    if not (0 <= x0 < x1 <= W and 0 <= y0 < y1 <= H):
+        raise ValueError(f"Crop {crop} is outside image size {(W, H)}")
+    rgb_crop = rgb[y0:y1, x0:x1]
+    return np.asarray(Image.fromarray(rgb_crop).resize((size, size), Image.BILINEAR), dtype=np.uint8)
+
+
+def resize_intrinsics(intr_raw: dict, crop: tuple[int, int, int, int], size: int) -> dict[str, float]:
+    x0, x1, y0, y1 = crop
+    crop_w, crop_h = x1 - x0, y1 - y0
+    sx = size / crop_w
+    sy = size / crop_h
+    return {
+        "fx": float(intr_raw["fx"]) * sx,
+        "fy": float(intr_raw["fy"]) * sy,
+        "cx": (float(intr_raw["cx"]) - x0) * sx,
+        "cy": (float(intr_raw["cy"]) - y0) * sy,
+        "width": int(size),
+        "height": int(size),
+    }
+
+
+def intrinsics_dict_to_matrix(intr: dict[str, float]) -> np.ndarray:
+    return np.array(
+        [
+            [float(intr["fx"]), 0.0, float(intr["cx"])],
+            [0.0, float(intr["fy"]), float(intr["cy"])],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
 
 
 def crop_resize_zed_capture(capture_dir: Path, crop: tuple[int, int, int, int], size: int):
@@ -155,25 +203,14 @@ def crop_resize_zed_capture(capture_dir: Path, crop: tuple[int, int, int, int], 
     if not (0 <= x0 < x1 <= W and 0 <= y0 < y1 <= H):
         raise ValueError(f"Crop {crop} is outside capture image size {(W, H)}")
 
-    crop_w, crop_h = x1 - x0, y1 - y0
-    rgb_crop = rgb[y0:y1, x0:x1]
     depth_crop = depth[y0:y1, x0:x1]
     xyz_crop = xyz[y0:y1, x0:x1]
 
-    rgb_256 = np.asarray(Image.fromarray(rgb_crop).resize((size, size), Image.BILINEAR), dtype=np.uint8)
+    rgb_256 = crop_resize_rgb_array(rgb, crop, size)
     depth_256 = resize_float_array(depth_crop, size)
     xyz_256 = resize_float_array(xyz_crop, size)
+    intr = resize_intrinsics(intr_raw, crop, size)
 
-    sx = size / crop_w
-    sy = size / crop_h
-    intr = {
-        "fx": float(intr_raw["fx"]) * sx,
-        "fy": float(intr_raw["fy"]) * sy,
-        "cx": (float(intr_raw["cx"]) - x0) * sx,
-        "cy": (float(intr_raw["cy"]) - y0) * sy,
-        "width": int(size),
-        "height": int(size),
-    }
     coord_file = capture_dir / "coordinate_system.txt"
     coordinate_system = coord_file.read_text().strip() if coord_file.is_file() else "unknown"
     return rgb_256, depth_256, xyz_256, intr, coordinate_system
@@ -209,6 +246,128 @@ def fallback_backproject(u: int, v: int, depth: np.ndarray, intr: dict[str, floa
     x = (float(u) - float(intr["cx"])) / float(intr["fx"]) * z
     y = (float(v) - float(intr["cy"])) / float(intr["fy"]) * z
     return np.array([x, y, z], dtype=np.float32)
+
+
+def resolve_episode_id(args: argparse.Namespace, plan_file: Path) -> str:
+    if args.episode_id:
+        return str(args.episode_id)
+    if args.plan_id:
+        return str(args.plan_id)
+    return plan_file.stem
+
+
+class LiveZedWmRecorder:
+    def __init__(self, args: argparse.Namespace, T_cam_to_base: np.ndarray, episode_dir: Path, episode_id: str):
+        self.args = args
+        self.crop = tuple(args.crop)
+        self.size = int(args.size)
+        self.T_base_to_camera = np.linalg.inv(np.asarray(T_cam_to_base, dtype=np.float64))
+        self.episode_dir = episode_dir
+        self.episode_id = episode_id
+        self.states: list[np.ndarray] = []
+        self.positions: list[np.ndarray] = []
+        self.grippers: list[float] = []
+        self.zed = None
+        self.runtime_params = None
+        self.image_mat = None
+        self.intrinsics: np.ndarray | None = None
+
+    def __enter__(self):
+        self.open()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+    def open(self) -> None:
+        import pyzed.sl as sl
+
+        resolution_map = {
+            "HD2K": sl.RESOLUTION.HD2K,
+            "HD1200": sl.RESOLUTION.HD1200,
+            "HD1080": sl.RESOLUTION.HD1080,
+            "HD720": sl.RESOLUTION.HD720,
+            "VGA": sl.RESOLUTION.VGA,
+        }
+        init_params = sl.InitParameters()
+        init_params.camera_resolution = resolution_map[self.args.zed_resolution]
+        init_params.camera_fps = int(self.args.zed_fps)
+        init_params.depth_mode = getattr(sl.DEPTH_MODE, self.args.zed_depth_mode)
+        init_params.coordinate_units = sl.UNIT.METER
+        init_params.coordinate_system = sl.COORDINATE_SYSTEM.IMAGE
+        init_params.set_from_camera_id(int(self.args.zed_camera_id))
+
+        self.zed = sl.Camera()
+        status = self.zed.open(init_params)
+        if status != sl.ERROR_CODE.SUCCESS:
+            raise RuntimeError(f"Failed to open ZED camera {self.args.zed_camera_id}: {status}")
+
+        self.runtime_params = sl.RuntimeParameters()
+        self.image_mat = sl.Mat()
+        for _ in range(max(0, int(self.args.zed_warmup_frames))):
+            self.zed.grab(self.runtime_params)
+
+        cam_info = self.zed.get_camera_information()
+        left = cam_info.camera_configuration.calibration_parameters.left_cam
+        intr_raw = {
+            "fx": left.fx,
+            "fy": left.fy,
+            "cx": left.cx,
+            "cy": left.cy,
+        }
+        resized_intr = resize_intrinsics(intr_raw, self.crop, self.size)
+        self.intrinsics = intrinsics_dict_to_matrix(resized_intr)
+
+    def close(self) -> None:
+        if self.zed is not None:
+            self.zed.close()
+            self.zed = None
+
+    def capture_rgb(self) -> np.ndarray:
+        import pyzed.sl as sl
+
+        if self.zed is None or self.runtime_params is None or self.image_mat is None:
+            raise RuntimeError("ZED recorder is not open")
+        status = self.zed.grab(self.runtime_params)
+        if status != sl.ERROR_CODE.SUCCESS:
+            raise RuntimeError(f"Failed to grab ZED frame for WM data: {status}")
+        self.zed.retrieve_image(self.image_mat, sl.VIEW.LEFT)
+        bgra = np.array(self.image_mat.get_data())
+        rgb = np.ascontiguousarray(bgra[..., [2, 1, 0]])
+        return crop_resize_rgb_array(rgb, self.crop, self.size)
+
+    def start_episode(self) -> None:
+        self.states.append(self.capture_rgb())
+
+    def record_step(self, ee_before: np.ndarray, ee_after: np.ndarray, gripper_action: int) -> None:
+        self.positions.append(np.stack([ee_before, ee_after], axis=0).astype(np.float32))
+        self.grippers.append(float(gripper_action))
+        self.states.append(self.capture_rgb())
+
+    def save(self) -> Path:
+        if self.intrinsics is None:
+            raise RuntimeError("Cannot save WM episode before opening ZED recorder")
+        if len(self.states) - 1 != len(self.positions) or len(self.positions) != len(self.grippers):
+            raise RuntimeError(
+                "Inconsistent WM episode lengths: "
+                f"states={len(self.states)}, positions={len(self.positions)}, grippers={len(self.grippers)}"
+            )
+        self.episode_dir.mkdir(parents=True, exist_ok=True)
+        path = self.episode_dir / f"{self.episode_id}.npz"
+        positions = np.asarray(self.positions, dtype=np.float32)
+        np.savez(
+            path,
+            states=np.asarray(self.states, dtype=np.uint8),
+            positions=positions,
+            valid_mask=np.ones(positions.shape[:2], dtype=bool),
+            grippers=np.asarray(self.grippers, dtype=np.float32),
+            penalty=np.asarray([0.0, 0.0], dtype=np.float32),
+            metric=np.asarray(0.0, dtype=np.float32),
+            intrinsics=self.intrinsics,
+            extrinsics=self.T_base_to_camera,
+        )
+        return path
 
 
 def build_targets(
@@ -307,7 +466,7 @@ def build_targets(
             )
         )
 
-        if action == GRIPPER_CLOSE:
+        if action == GRIPPER_CLOSE and not gripping_tool:
             gripping_tool = True
             grip_z_floor_m = float(target_position[2])
             print("setting grip_z_floor_m to ", grip_z_floor_m)
@@ -515,6 +674,7 @@ def save_records_json(
 def plan_segments(
     targets: list[TargetRecord],
     scene_points: np.ndarray,
+    T_cam_to_base: np.ndarray,
     execute: bool,
     args: argparse.Namespace,
 ):
@@ -529,6 +689,7 @@ def plan_segments(
 
     current_joints_np = controller.get_robot_joints()
     current_joints = torch.tensor(current_joints_np, dtype=torch.float32, device=args.torch_device)
+    # NOTE: point cloud is not being used for motion planning, but is used for visualization
     motion_planner = MotionPlanner(scene_points)
 
     # motion_planner.visualize_world_and_robot(current_joints)
@@ -570,16 +731,41 @@ def plan_segments(
     if not execute:
         return trajectories
 
-    for target, trajectory in zip(targets, trajectories):
-        assert trajectory is not None
-        current_gripper = controller.close_gripper_action if controller.get_gripper_state() == controller.close_gripper_action else controller.open_gripper_action
-        controller.move_along_trajectory(trajectory, gripper_state=current_gripper)
-        if target.gripper_action == GRIPPER_CLOSE:
-            controller.close_gripper(num_steps=args.gripper_steps)
-        elif target.gripper_action == GRIPPER_OPEN:
-            controller.open_gripper(num_steps=args.gripper_steps)
+    recorder = None
+    if args.collect_wm_data:
+        recorder = LiveZedWmRecorder(args, T_cam_to_base, args.resolved_episode_dir, args.resolved_episode_id)
 
-    return trajectories
+    try:
+        if recorder is not None:
+            recorder.open()
+            recorder.start_episode()
+
+        for target, trajectory in zip(targets, trajectories):
+            assert trajectory is not None
+            ee_before = controller.get_gripper_pose()[:3].astype(np.float32)
+            current_gripper = controller.close_gripper_action if controller.get_gripper_state() == controller.close_gripper_action else controller.open_gripper_action
+            controller.move_along_trajectory(trajectory, gripper_state=current_gripper)
+            if target.gripper_action == GRIPPER_CLOSE:
+                controller.close_gripper(num_steps=args.gripper_steps)
+            elif target.gripper_action == GRIPPER_OPEN:
+                controller.open_gripper(num_steps=args.gripper_steps)
+            ee_after = controller.get_gripper_pose()[:3].astype(np.float32)
+
+            if recorder is not None:
+                if args.capture_settle_s > 0.0:
+                    import time
+
+                    time.sleep(float(args.capture_settle_s))
+                recorder.record_step(ee_before, ee_after, target.gripper_action)
+
+        if recorder is not None:
+            episode_path = recorder.save()
+            print(f"Saved WM episode: {episode_path}")
+
+        return trajectories
+    finally:
+        if recorder is not None:
+            recorder.close()
 
 
 def print_target_summary(targets: list[TargetRecord]) -> None:
@@ -600,11 +786,29 @@ def print_target_summary(targets: list[TargetRecord]) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--scene-dir", default=str(DEFAULT_SCENE_DIR))
+    parser.add_argument("--task-name", choices=tuple(TASK_TO_TOOL), default=DEFAULT_TASK_NAME)
+    parser.add_argument("--scene-dir", default=None, help="Plan root override. Defaults to data/<task-name>/vlm_traj_queries/<tool>.")
     parser.add_argument("--plan-id", default=None)
     parser.add_argument("--plan-file", default=None)
-    parser.add_argument("--zed-capture-dir", default=None)
     parser.add_argument("--extrinsics", default=str(DEFAULT_EXTRINSICS))
+    parser.add_argument(
+        "--collect-wm-data",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="During --execute, save a WM-compatible real-world episode .npz. Use --no-collect-wm-data to disable.",
+    )
+    parser.add_argument("--episode-dir", default=None, help="Directory for collected WM episode .npz files.")
+    parser.add_argument("--episode-id", default=None, help="Episode file stem. Defaults to --plan-id, otherwise the plan file stem.")
+    parser.add_argument("--zed-camera-id", type=int, default=1)
+    parser.add_argument("--zed-resolution", choices=("HD2K", "HD1200", "HD1080", "HD720", "VGA"), default="HD720")
+    parser.add_argument("--zed-fps", type=int, default=30)
+    parser.add_argument(
+        "--zed-depth-mode",
+        choices=("NEURAL_PLUS", "NEURAL", "NEURAL_LIGHT", "ULTRA", "QUALITY", "PERFORMANCE"),
+        default="NEURAL",
+    )
+    parser.add_argument("--zed-warmup-frames", type=int, default=5)
+    parser.add_argument("--capture-settle-s", type=float, default=0.25)
     parser.add_argument("--crop", nargs=4, type=int, default=list(DEFAULT_CROP), metavar=("X0", "X1", "Y0", "Y1"))
     parser.add_argument("--size", type=int, default=256)
     parser.add_argument("--execute", action="store_true", help="Move the real robot after a successful dry-run/planning pass.")
@@ -634,6 +838,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     args.crop = tuple(args.crop)
+    if args.execute and args.collect_wm_data and args.skip_planning:
+        raise ValueError("WM data collection requires planning/execution; remove --skip-planning or pass --no-collect-wm-data")
 
     plan_file = resolve_plan_file(args)
     if not plan_file.is_file():
@@ -641,19 +847,26 @@ def main() -> int:
 
     plan_dir = plan_file.parent
     vis_dir = resolve_path(args.vis_dir, base=plan_dir) if args.vis_dir is not None else plan_dir / "dry_run_vis"
+    args.resolved_episode_dir = (
+        resolve_path(args.episode_dir) if args.episode_dir is not None else default_episode_dir(args.task_name)
+    )
+    args.resolved_episode_id = resolve_episode_id(args, plan_file)
 
-    zed_capture_dir = resolve_path(args.zed_capture_dir) if args.zed_capture_dir else latest_zed_capture()
+    zed_capture_dir = default_zed_capture_dir(args.task_name)
     extrinsics = resolve_path(args.extrinsics)
     if not zed_capture_dir.is_dir():
         raise FileNotFoundError(f"ZED capture directory not found: {zed_capture_dir}")
     if not extrinsics.is_file():
         raise FileNotFoundError(f"Extrinsics file not found: {extrinsics}")
 
+    print(f"Task:       {args.task_name} ({task_tool(args.task_name)})")
     print(f"Plan:       {plan_file}")
     print(f"ZED:        {zed_capture_dir}")
     print(f"Extrinsics: {extrinsics} (camera_to_base)")
     print(f"Vis dir:    {vis_dir}")
     print(f"Mode:       {'EXECUTE' if args.execute else 'DRY RUN'}")
+    if args.execute and args.collect_wm_data:
+        print(f"WM episode: {args.resolved_episode_dir / (args.resolved_episode_id + '.npz')}")
 
     plan = load_plan(plan_file)
     rgb_256, depth_256, xyz_256, intr, zed_coordinate_system = crop_resize_zed_capture(zed_capture_dir, args.crop, args.size)
@@ -691,7 +904,7 @@ def main() -> int:
 
     try:
         if not args.skip_planning:
-            plan_segments(targets, scene_points, execute=args.execute, args=args)
+            plan_segments(targets, scene_points, T_cam_to_base, execute=args.execute, args=args)
         else:
             print("Skipping MotionPlanner planning because --skip-planning was passed.")
     except Exception:

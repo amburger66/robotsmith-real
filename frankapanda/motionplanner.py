@@ -40,7 +40,7 @@ torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
-EE_LINK_CENTER_TO_GRIPPER_TIP = 0.08
+EE_LINK_CENTER_TO_GRIPPER_TIP = 0.09
 
 # Constants for motion planning
 CUROBO_ASSETS_PATH = "visplan/submodules/curobo/src/curobo/content/assets/"       # Have to save here because cuRobo looks for mesh obstacles here
