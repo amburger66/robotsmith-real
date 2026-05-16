@@ -22,7 +22,7 @@ def parse_args() -> argparse.Namespace:
     here = os.path.dirname(os.path.abspath(__file__))
     p.add_argument(
         "--input-dir",
-        default=os.path.join(here, "zed1_20260515_093719"),
+        default="data/zed_captures/zed1_20260516_170417",
         help="Directory containing rgb.png/rgb.npy/depth_m.npy/xyz_m.npy/camera_intrinsics.npz",
     )
     p.add_argument(
