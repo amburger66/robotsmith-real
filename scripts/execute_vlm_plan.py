@@ -44,11 +44,14 @@ DEFAULT_TASK_NAME = "task08_cutting"
 DEFAULT_EXTRINSICS = DATA_ROOT / "calibration/eye_to_hand/cam0_calibration.npz"
 ZED_CAPTURE_DIR = {
     "task08_cutting": "data/zed_captures/zed1_20260515_131532",
-    "task03_flatten": "data/zed_captures/zed1_20260516_154329",
+    "task03_flatten": "data/zed_captures/zed1_20260516_170417",
 }
 
 DEFAULT_CROP = (380, 1000, 0, 620)
-DEFAULT_GRIPPER_QUAT_WXYZ = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32)
+TASK_DEFAULT_GRIPPER_QUAT_WXYZ = {
+    "task08_cutting": np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32),
+    "task03_flatten": np.array([0.0, 0.70710678, -0.70710678, 0.0], dtype=np.float32),
+}
 
 GRIPPER_CLOSE = 0
 GRIPPER_OPEN = 1
@@ -104,6 +107,13 @@ def default_zed_capture_dir(task_name: str) -> Path:
         raise ValueError(f"ZED_CAPTURE_DIR[{task_name!r}] is not configured")
     return resolve_path(capture)
 
+def default_gripper_quat(task_name: str) -> np.ndarray:
+    try:
+        return TASK_DEFAULT_GRIPPER_QUAT_WXYZ[task_name].copy()
+    except KeyError as exc:
+        supported = ", ".join(sorted(TASK_DEFAULT_GRIPPER_QUAT_WXYZ))
+        raise ValueError(f"No default gripper quaternion for task {task_name!r}; expected one of: {supported}") from exc
+
 def parse_quat(raw: str) -> np.ndarray:
     values = [float(v.strip()) for v in raw.split(",")]
     if len(values) != 4:
@@ -128,13 +138,50 @@ def load_plan(plan_file: Path) -> list[list[float]]:
     return plan
 
 
+def resolve_scene_dir(args: argparse.Namespace) -> Path:
+    return resolve_path(args.scene_dir) if args.scene_dir is not None else default_scene_dir(args.task_name)
+
+
 def resolve_plan_file(args: argparse.Namespace) -> Path:
     if args.plan_file is not None:
         return resolve_path(args.plan_file)
-    scene_dir = resolve_path(args.scene_dir) if args.scene_dir is not None else default_scene_dir(args.task_name)
     if args.plan_id is None:
-        raise ValueError("Provide --plan-id or --plan-file")
-    return scene_dir / args.plan_id / "initial_0_robot.json"
+        raise ValueError("Provide --plan-id, --plan-file, or --all-plans")
+    return resolve_scene_dir(args) / args.plan_id / "initial_0_robot.json"
+
+
+def resolve_plan_files(args: argparse.Namespace) -> list[Path]:
+    if args.all_plans:
+        if args.plan_file is not None or args.plan_id is not None:
+            raise ValueError("--all-plans cannot be combined with --plan-id or --plan-file")
+        if args.episode_id is not None:
+            raise ValueError("--all-plans cannot be combined with --episode-id; each plan folder name is used as its episode id")
+        scene_dir = resolve_scene_dir(args)
+        if not scene_dir.is_dir():
+            raise FileNotFoundError(f"Scene directory not found: {scene_dir}")
+        plan_files = sorted(p / "initial_0_robot.json" for p in scene_dir.iterdir() if (p / "initial_0_robot.json").is_file())
+        if not plan_files:
+            raise FileNotFoundError(f"No initial_0_robot.json plans found under: {scene_dir}")
+        return plan_files
+    return [resolve_plan_file(args)]
+
+
+def prompt_continue_to_next_plan(next_plan_file: Path) -> bool:
+    try:
+        response = input(f"\nPress Enter to continue to next plan ({next_plan_file.parent.name}), or type q then Enter to stop: ")
+    except EOFError:
+        print("\nNo input available; stopping before next plan.")
+        return False
+    return response.strip().lower() not in {"q", "quit", "n", "no", "stop"}
+
+
+def prompt_reset_home_after_plan() -> bool:
+    try:
+        response = input("\nPlan complete. Press Enter to reset robot to home, or type skip then Enter to leave it where it is: ")
+    except EOFError:
+        print("\nNo input available; skipping post-plan home reset.")
+        return False
+    return response.strip().lower() not in {"s", "skip", "q", "quit", "n", "no"}
 
 
 def resize_float_array(arr: np.ndarray, size: int) -> np.ndarray:
@@ -562,12 +609,12 @@ def target_marker_points(position: np.ndarray, radius: float = 0.015) -> np.ndar
 def gripper_glyph_points(pose: np.ndarray) -> np.ndarray:
     """Return a simple point-sampled gripper glyph in the target pose frame."""
     T = pose_to_transform_wxyz(pose)
-    # Local convention for visualization only: palm opens along local y, fingers
-    # extend along local -z. This makes the fixed scraper orientation visible.
+    # Local convention for visualization only: palm opens along local y. With
+    # the fixed fingers-down quaternion, local +z maps to base-frame -z.
     local_segments = [
         (np.array([0.0, -0.04, 0.0]), np.array([0.0, 0.04, 0.0])),
-        (np.array([0.0, -0.04, 0.0]), np.array([0.0, -0.04, -0.08])),
-        (np.array([0.0, 0.04, 0.0]), np.array([0.0, 0.04, -0.08])),
+        (np.array([0.0, -0.04, 0.0]), np.array([0.0, -0.04, 0.08])),
+        (np.array([0.0, 0.04, 0.0]), np.array([0.0, 0.04, 0.08])),
         (np.array([-0.02, 0.0, 0.0]), np.array([0.02, 0.0, 0.0])),
     ]
     pts = []
@@ -671,101 +718,123 @@ def save_records_json(
         json.dump(payload, f, indent=2)
 
 
+def close_franka_controller(controller) -> None:
+    robot_interface = getattr(controller, "robot_interface", None)
+    if robot_interface is not None:
+        robot_interface.close()
+
+
 def plan_segments(
     targets: list[TargetRecord],
     scene_points: np.ndarray,
     T_cam_to_base: np.ndarray,
     execute: bool,
     args: argparse.Namespace,
+    controller=None,
+    motion_planner=None,
 ):
     import torch
     from frankapanda import FrankaPandaController
-    from frankapanda.motionplanner import MotionPlanner
 
-    controller = FrankaPandaController()
-    if execute and args.home_first:
-        controller.open_gripper()
-        controller.move_to_joints(controller.home_joints, controller.open_gripper_action)
-
-    current_joints_np = controller.get_robot_joints()
-    current_joints = torch.tensor(current_joints_np, dtype=torch.float32, device=args.torch_device)
-    # NOTE: point cloud is not being used for motion planning, but is used for visualization
-    motion_planner = MotionPlanner(scene_points)
-
-    # motion_planner.visualize_world_and_robot(current_joints)
-
-    trajectories = []
-    for target in targets:
-        print("Planning target: ", target.index)
-        if not target.valid or target.target_pose_wxyz is None:
-            target.planning_success = False
-            continue
-
-        goal_pose_np = np.asarray(target.target_pose_wxyz, dtype=np.float32)
-        goal_pose = torch.tensor(goal_pose_np, dtype=torch.float32, device=args.torch_device)
-
-        if args.dry_run:
-            motion_planner.visualize_world_and_robot(current_joints, goal_pose)
-
-        # Allow the hand/fingers to occupy the target contact region while still
-        # checking the rest of the arm against the ZED collision cloud.
-        traj, success = motion_planner.plan_to_goal_poses(
-            current_joints=current_joints.unsqueeze(0),
-            goal_poses=goal_pose.unsqueeze(0),
-            plan_config=motion_planner.fixed_gripper_orientation_plan_config,
-            disable_collision_links=motion_planner.links[-5:],
-        )
-        print("Planning success: ", success.item())
-        target.planning_success = bool(success.item())
-        if not target.planning_success:
-            break
-
-        trajectories.append(traj[0].detach().cpu().numpy())
-        current_joints = traj[0, -1].detach()
-
-    all_success = all(t.valid and bool(t.planning_success) for t in targets)
-    if not all_success:
-        failed = [t.index for t in targets if not (t.valid and bool(t.planning_success))]
-        raise RuntimeError(f"Planning failed for target indices: {failed}")
-
-    if not execute:
-        return trajectories
-
-    recorder = None
-    if args.collect_wm_data:
-        recorder = LiveZedWmRecorder(args, T_cam_to_base, args.resolved_episode_dir, args.resolved_episode_id)
-
+    owns_controller = controller is None
+    if controller is None:
+        controller = FrankaPandaController()
     try:
-        if recorder is not None:
-            recorder.open()
-            recorder.start_episode()
+        if execute and args.home_first:
+            controller.open_gripper()
+            controller.move_to_joints(controller.home_joints, controller.open_gripper_action)
 
-        for target, trajectory in zip(targets, trajectories):
-            assert trajectory is not None
-            ee_before = controller.get_gripper_pose()[:3].astype(np.float32)
-            current_gripper = controller.close_gripper_action if controller.get_gripper_state() == controller.close_gripper_action else controller.open_gripper_action
-            controller.move_along_trajectory(trajectory, gripper_state=current_gripper)
-            if target.gripper_action == GRIPPER_CLOSE:
-                controller.close_gripper(num_steps=args.gripper_steps)
-            elif target.gripper_action == GRIPPER_OPEN:
-                controller.open_gripper(num_steps=args.gripper_steps)
-            ee_after = controller.get_gripper_pose()[:3].astype(np.float32)
+        current_joints_np = controller.get_robot_joints()
+        current_joints = torch.tensor(current_joints_np, dtype=torch.float32, device=args.torch_device)
+        # NOTE: point cloud is not being used for collision planning here, but the
+        # MotionPlanner still owns the cuRobo/world setup and visualization helpers.
+        if motion_planner is None:
+            from frankapanda.motionplanner import MotionPlanner
+
+            motion_planner = MotionPlanner(scene_points)
+
+        trajectories = []
+        for target in targets:
+            print("Planning target: ", target.index)
+            if not target.valid or target.target_pose_wxyz is None:
+                target.planning_success = False
+                continue
+
+            goal_pose_np = np.asarray(target.target_pose_wxyz, dtype=np.float32)
+            goal_pose = torch.tensor(goal_pose_np, dtype=torch.float32, device=args.torch_device)
+
+            if args.dry_run:
+                motion_planner.visualize_world_and_robot(current_joints, goal_pose)
+
+            # Allow the hand/fingers to occupy the target contact region while still
+            # checking the rest of the arm against the ZED collision cloud.
+            traj, success = motion_planner.plan_to_goal_poses(
+                current_joints=current_joints.unsqueeze(0),
+                goal_poses=goal_pose.unsqueeze(0),
+                plan_config=motion_planner.fixed_gripper_orientation_plan_config,
+                disable_collision_links=motion_planner.links[-5:],
+            )
+            print("Planning success: ", success.item())
+            target.planning_success = bool(success.item())
+            if not target.planning_success:
+                break
+
+            trajectories.append(traj[0].detach().cpu().numpy())
+            current_joints = traj[0, -1].detach()
+
+        all_success = all(t.valid and bool(t.planning_success) for t in targets)
+        if not all_success:
+            failed = [t.index for t in targets if not (t.valid and bool(t.planning_success))]
+            raise RuntimeError(f"Planning failed for target indices: {failed}")
+
+        if not execute:
+            return trajectories
+
+        recorder = None
+        if args.collect_wm_data:
+            recorder = LiveZedWmRecorder(args, T_cam_to_base, args.resolved_episode_dir, args.resolved_episode_id)
+
+        try:
+            if recorder is not None:
+                recorder.open()
+                recorder.start_episode()
+
+            for target, trajectory in zip(targets, trajectories):
+                assert trajectory is not None
+                ee_before = controller.get_gripper_pose()[:3].astype(np.float32)
+                current_gripper = controller.close_gripper_action if controller.get_gripper_state() == controller.close_gripper_action else controller.open_gripper_action
+                controller.move_along_trajectory(trajectory, gripper_state=current_gripper)
+                if target.gripper_action == GRIPPER_CLOSE:
+                    controller.close_gripper(num_steps=args.gripper_steps)
+                elif target.gripper_action == GRIPPER_OPEN:
+                    controller.open_gripper(num_steps=args.gripper_steps)
+                ee_after = controller.get_gripper_pose()[:3].astype(np.float32)
+
+                if recorder is not None:
+                    if args.capture_settle_s > 0.0:
+                        import time
+
+                        time.sleep(float(args.capture_settle_s))
+                    recorder.record_step(ee_before, ee_after, target.gripper_action)
 
             if recorder is not None:
-                if args.capture_settle_s > 0.0:
-                    import time
+                episode_path = recorder.save()
+                print(f"Saved WM episode: {episode_path}")
 
-                    time.sleep(float(args.capture_settle_s))
-                recorder.record_step(ee_before, ee_after, target.gripper_action)
+            if args.all_plans:
+                if prompt_reset_home_after_plan():
+                    print("Resetting robot to home...")
+                    controller.move_to_joints(controller.home_joints, controller.open_gripper_action)
+                    print("Robot is home.")
 
-        if recorder is not None:
-            episode_path = recorder.save()
-            print(f"Saved WM episode: {episode_path}")
+            return trajectories
+        finally:
+            if recorder is not None:
+                recorder.close()
 
-        return trajectories
     finally:
-        if recorder is not None:
-            recorder.close()
+        if owns_controller:
+            close_franka_controller(controller)
 
 
 def print_target_summary(targets: list[TargetRecord]) -> None:
@@ -790,6 +859,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scene-dir", default=None, help="Plan root override. Defaults to data/<task-name>/vlm_traj_queries/<tool>.")
     parser.add_argument("--plan-id", default=None)
     parser.add_argument("--plan-file", default=None)
+    parser.add_argument("--all-plans", action="store_true", help="Run every <plan-id>/initial_0_robot.json under the selected scene directory, pausing between plans.")
     parser.add_argument("--extrinsics", default=str(DEFAULT_EXTRINSICS))
     parser.add_argument(
         "--collect-wm-data",
@@ -798,7 +868,7 @@ def parse_args() -> argparse.Namespace:
         help="During --execute, save a WM-compatible real-world episode .npz. Use --no-collect-wm-data to disable.",
     )
     parser.add_argument("--episode-dir", default=None, help="Directory for collected WM episode .npz files.")
-    parser.add_argument("--episode-id", default=None, help="Episode file stem. Defaults to --plan-id, otherwise the plan file stem.")
+    parser.add_argument("--episode-id", default=None, help="Episode file stem. Defaults to --plan-id, otherwise the plan file stem. Not allowed with --all-plans.")
     parser.add_argument("--zed-camera-id", type=int, default=1)
     parser.add_argument("--zed-resolution", choices=("HD2K", "HD1200", "HD1080", "HD720", "VGA"), default="HD720")
     parser.add_argument("--zed-fps", type=int, default=30)
@@ -815,7 +885,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="Explicitly request dry-run behavior; this is the default unless --execute is set.")
     parser.add_argument("--vis-dir", default=None)
     parser.add_argument("--show-vis", action="store_true")
-    parser.add_argument("--gripper-quat", type=parse_quat, default=DEFAULT_GRIPPER_QUAT_WXYZ)
+    parser.add_argument(
+        "--gripper-quat",
+        type=parse_quat,
+        default=None,
+        help="Optional w,x,y,z override. Defaults are task-specific: cutting opens along y, flatten opens along x.",
+    )
     parser.add_argument(
         "--ignore-xyz-offsets",
         action="store_true",
@@ -835,18 +910,24 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> int:
-    args = parse_args()
-    args.crop = tuple(args.crop)
-    if args.execute and args.collect_wm_data and args.skip_planning:
-        raise ValueError("WM data collection requires planning/execution; remove --skip-planning or pass --no-collect-wm-data")
-
-    plan_file = resolve_plan_file(args)
+def run_one_plan(
+    args: argparse.Namespace,
+    plan_file: Path,
+    *,
+    batch_vis_root: Path | None = None,
+    controller=None,
+    motion_planner_cache: dict | None = None,
+) -> None:
     if not plan_file.is_file():
         raise FileNotFoundError(f"Plan file not found: {plan_file}")
 
     plan_dir = plan_file.parent
-    vis_dir = resolve_path(args.vis_dir, base=plan_dir) if args.vis_dir is not None else plan_dir / "dry_run_vis"
+    if batch_vis_root is not None:
+        vis_dir = batch_vis_root / plan_dir.name
+    else:
+        vis_dir = resolve_path(args.vis_dir, base=plan_dir) if args.vis_dir is not None else plan_dir / "dry_run_vis"
+
+    args.plan_id = plan_dir.name if args.plan_id is None else args.plan_id
     args.resolved_episode_dir = (
         resolve_path(args.episode_dir) if args.episode_dir is not None else default_episode_dir(args.task_name)
     )
@@ -904,7 +985,24 @@ def main() -> int:
 
     try:
         if not args.skip_planning:
-            plan_segments(targets, scene_points, T_cam_to_base, execute=args.execute, args=args)
+            motion_planner = None
+            if motion_planner_cache is not None:
+                motion_planner = motion_planner_cache.get("motion_planner")
+                if motion_planner is None:
+                    from frankapanda.motionplanner import MotionPlanner
+
+                    print("Initializing shared MotionPlanner for batch mode...")
+                    motion_planner = MotionPlanner(scene_points)
+                    motion_planner_cache["motion_planner"] = motion_planner
+            plan_segments(
+                targets,
+                scene_points,
+                T_cam_to_base,
+                execute=args.execute,
+                args=args,
+                controller=controller,
+                motion_planner=motion_planner,
+            )
         else:
             print("Skipping MotionPlanner planning because --skip-planning was passed.")
     except Exception:
@@ -919,6 +1017,51 @@ def main() -> int:
     print(f"  {vis_dir / 'targets_3d.json'}")
     if not args.execute:
         print("\nRobot was not moved. Pass --execute after inspecting the dry-run outputs.")
+
+
+def main() -> int:
+    args = parse_args()
+    args.crop = tuple(args.crop)
+    if args.gripper_quat is None:
+        args.gripper_quat = default_gripper_quat(args.task_name)
+    if args.execute and args.collect_wm_data and args.skip_planning:
+        raise ValueError("WM data collection requires planning/execution; remove --skip-planning or pass --no-collect-wm-data")
+
+    plan_files = resolve_plan_files(args)
+    batch_vis_root = resolve_path(args.vis_dir) if args.all_plans and args.vis_dir is not None else None
+    if args.all_plans:
+        print(f"Found {len(plan_files)} plans under {resolve_scene_dir(args)}")
+
+    shared_controller = None
+    shared_motion_planner_cache = {"motion_planner": None} if args.all_plans and not args.skip_planning else None
+    if args.all_plans and not args.skip_planning:
+        from frankapanda import FrankaPandaController
+
+        shared_controller = FrankaPandaController()
+
+    try:
+        for i, plan_file in enumerate(plan_files):
+            if args.all_plans:
+                print(f"\n=== Plan {i + 1}/{len(plan_files)}: {plan_file.parent.name} ===")
+            run_args = argparse.Namespace(**vars(args))
+            run_args.plan_id = plan_file.parent.name
+            run_args.plan_file = str(plan_file)
+            run_one_plan(
+                run_args,
+                plan_file,
+                batch_vis_root=batch_vis_root,
+                controller=shared_controller,
+                motion_planner_cache=shared_motion_planner_cache,
+            )
+
+            if args.all_plans and i < len(plan_files) - 1:
+                if not prompt_continue_to_next_plan(plan_files[i + 1]):
+                    print("Stopping before next plan.")
+                    break
+    finally:
+        if shared_controller is not None:
+            close_franka_controller(shared_controller)
+
     return 0
 
 
