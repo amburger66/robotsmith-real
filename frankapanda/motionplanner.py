@@ -40,7 +40,7 @@ torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
-EE_LINK_CENTER_TO_GRIPPER_TIP = 0.13
+EE_LINK_CENTER_TO_GRIPPER_TIP = 0.08
 
 # Constants for motion planning
 CUROBO_ASSETS_PATH = "visplan/submodules/curobo/src/curobo/content/assets/"       # Have to save here because cuRobo looks for mesh obstacles here
@@ -65,6 +65,16 @@ class MotionPlanner:
         pointcloud = pointcloud[pointcloud[:, 1] >= 0]
         self.pointcloud = pointcloud
         self.reset_planner(pointcloud)
+
+        self.fixed_gripper_orientation_constraint = PoseCostMetric(
+            hold_partial_pose=True,
+            hold_vec_weight=torch.tensor([1, 1, 1, 0, 0, 0], device="cuda:0"),
+            project_to_goal_frame=False,
+        )
+        self.fixed_gripper_orientation_plan_config = MotionGenPlanConfig(
+            max_attempts=100,
+            pose_cost_metric=self.fixed_gripper_orientation_constraint,
+        )
 
         self.along_z_axis_constraint = PoseCostMetric(
             hold_vec_weight = torch.tensor([1, 1, 1, 1, 1, 0], device="cuda:0"),
@@ -157,21 +167,20 @@ class MotionPlanner:
 
         self.table = Cuboid(
             name = "table",
-            pose = [0.5, 0., -(-0.03 + 0.2), 1, 0, 0, 0],
-            dims = [1., 1.4, 0.4]
+            pose = [0.5, 0., -0.1, 1, 0, 0, 0],
+            dims = [1., 1.4, 0.2]
         )
 
-        self.front_wall = Cuboid(
-            name = "front_wall",
-            pose = [0.85, 0., 0.5, 1, 0, 0, 0],
-            dims = [0.2, 1.4, 1.0]
+        self.camera_stand1 = Cuboid(
+            name = "camera_stand1",
+            pose = [0.27 / 2, (0.29 + 0.55) / 2, (0.48 - 0.09) / 2, 1, 0, 0, 0],
+            dims = [0.17, 0.2, 0.7]
         )
 
-        # These are from robot perspective
-        self.right_wall = Cuboid(
-            name = "right_wall",
-            pose = [0.5, -(0.52 + 0.2/2), 0.5, 1, 0, 0, 0],
-            dims = [1., 0.2, 1.0]
+        self.camera_stand2 = Cuboid(
+            name = "camera_stand2",
+            pose = [0.27 / 2, (-0.43 - 0.28) / 2, 0.11, 1, 0, 0, 0],
+            dims = [0.1, 0.1, 0.4]
         )
 
         self.pointcloud_mesh = Mesh.from_pointcloud(
@@ -182,35 +191,11 @@ class MotionPlanner:
             filter_close_points=0.3,
         )
 
-        self.shelf_top = Cuboid(
-            name = "table",
-            pose = [0.56, 0.45, (0.58 + 0.1/2), 1, 0, 0, 0],
-            dims = [0.7, 0.7, 0.1]
-        )
-
-        # Dummy obstacles for forcing intermediate poses (disabled by default)
-        # Blocks shelf side of table: y from -0.05 to 0.7
-        self.shelf_side_blocker = Cuboid(
-            name = "shelf_side_blocker",
-            pose = [0.56, 0.4, 0.3, 1, 0, 0, 0],  # center at y=0.325, z=0.3
-            dims = [0.7, 0.75, 0.5]  # spans y=-0.05 to y=0.7, z=0.05 to z=0.55
-        )
-
-        # Blocks object area on table: y from -0.52 to -0.05, z up to 0.3
-        self.object_area_blocker = Cuboid(
-            name = "object_area_blocker",
-            pose = [0.5, -0.285, 0.05, 1, 0, 0, 0],  # center at y=-0.285, z=0.165
-            dims = [1.0, 0.47, 0.15]  # spans y=-0.52 to y=-0.05, z=0.03 to z=0.3
-        )
-
         self.world_config.add_obstacle(self.back_wall)
         self.world_config.add_obstacle(self.table)
-        self.world_config.add_obstacle(self.front_wall)
-        self.world_config.add_obstacle(self.pointcloud_mesh)
-        self.world_config.add_obstacle(self.right_wall)
-        # self.world_config.add_obstacle(self.shelf_top)
-        # self.world_config.add_obstacle(self.shelf_side_blocker)
-        # self.world_config.add_obstacle(self.object_area_blocker)
+        self.world_config.add_obstacle(self.camera_stand1)
+        self.world_config.add_obstacle(self.camera_stand2)
+        # self.world_config.add_obstacle(self.pointcloud_mesh)
 
         motion_gen_config = MotionGenConfig.load_from_robot_config(
             robot_file,
@@ -227,22 +212,6 @@ class MotionPlanner:
 
         # self.motion_gen.warmup(enable_graph=True, n_goalset=100)
         self.motion_gen.warmup(n_goalset=200)
-
-        # Disable dummy blockers by default
-        # self.motion_gen.world_coll_checker.enable_obstacle(enable=False, name="shelf_side_blocker")
-        # self.motion_gen.world_coll_checker.enable_obstacle(enable=False, name="object_area_blocker")
-
-    def enable_intermediate_pose_blockers(self, enable: bool = True):
-        """
-        Enable or disable the dummy obstacles that force intermediate poses
-        when moving to shelf insertion position.
-
-        Args:
-            enable: If True, enable the blockers. If False, disable them.
-        """
-        pass
-        # self.motion_gen.world_coll_checker.enable_obstacle(enable=enable, name="shelf_side_blocker")
-        # self.motion_gen.world_coll_checker.enable_obstacle(enable=enable, name="object_area_blocker")
 
     def set_collision_world_components(
         self,  
