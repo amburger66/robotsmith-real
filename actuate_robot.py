@@ -33,11 +33,4 @@ while True:
         controller_cfg=controller_cfg,
     )
 
-for _ in range(10):
-    robot_interface.control(
-        controller_type=controller_type,
-        action=target_joint_positions + [CLOSE_GRIPPER],
-        controller_cfg=controller_cfg,
-    )
-
 robot_interface.close()
