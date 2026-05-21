@@ -51,7 +51,7 @@ def main() -> None:
     S = args.size
 
     rgb_np = np.load(os.path.join(in_dir, "rgb.npy"))
-    depth = np.load(os.path.join(in_dir, "depth_m.npy"))
+    depth = np.load(os.path.join(in_dir, "initial_depth.npy"))
     xyz = np.load(os.path.join(in_dir, "xyz_m.npy"))
     intr = dict(np.load(os.path.join(in_dir, "camera_intrinsics.npz")))
 
@@ -87,9 +87,9 @@ def main() -> None:
     cx_new = (float(intr["cx"]) - x0) * sx
     cy_new = (float(intr["cy"]) - y0) * sy
 
-    rgb_img.save(os.path.join(out_dir, "rgb.png"))
+    rgb_img.save(os.path.join(out_dir, "initial.png"))
     np.save(os.path.join(out_dir, "rgb.npy"), rgb_out)
-    np.save(os.path.join(out_dir, "depth_m.npy"), depth_out)
+    np.save(os.path.join(out_dir, "initial_depth.npy"), depth_out)
     np.save(os.path.join(out_dir, "xyz_m.npy"), xyz_out)
     np.savez(
         os.path.join(out_dir, "camera_intrinsics.npz"),
