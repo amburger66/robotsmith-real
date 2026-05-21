@@ -6,6 +6,11 @@ import cv2
 import numpy as np
 import pyzed.sl as sl
 
+from frankapanda.perception.zed_cams import (
+    DEFAULT_ZED_CAMERA_ID,
+    apply_camera_to_init_params,
+)
+
 
 def sl_mat_to_numpy(mat: sl.Mat) -> np.ndarray:
     arr = mat.get_data()
@@ -14,7 +19,12 @@ def sl_mat_to_numpy(mat: sl.Mat) -> np.ndarray:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--camera_id", type=int, default=1)
+    parser.add_argument(
+        "--camera_id",
+        type=int,
+        default=DEFAULT_ZED_CAMERA_ID,
+        help="Logical camera id (mapped to serial via zed_cams.ZedCams.id2serial).",
+    )
     parser.add_argument("--out_dir", type=str, default="data/zed_captures")
     parser.add_argument("--resolution", type=str, default="HD720")
     parser.add_argument("--fps", type=int, default=30)
@@ -41,13 +51,14 @@ def main():
     init_params.coordinate_units = sl.UNIT.METER
     init_params.coordinate_system = getattr(sl.COORDINATE_SYSTEM, args.coordinate_system)
 
-    # For multiple ZEDs, this selects by camera index.
-    init_params.set_from_camera_id(args.camera_id)
+    serial = apply_camera_to_init_params(init_params, args.camera_id)
 
     zed = sl.Camera()
     status = zed.open(init_params)
     if status != sl.ERROR_CODE.SUCCESS:
-        raise RuntimeError(f"Failed to open ZED camera {args.camera_id}: {status}")
+        raise RuntimeError(
+            f"Failed to open ZED camera id={args.camera_id} serial={serial}: {status}"
+        )
 
     runtime_params = sl.RuntimeParameters()
 

@@ -36,6 +36,10 @@ for path in (ROBOTSMITH_ROOT, ROBOTSMITH_ROOT / "robo_utils"):
         sys.path.insert(0, path_str)
 
 from frankapanda.motionplanner import EE_LINK_CENTER_TO_GRIPPER_TIP
+from frankapanda.perception.zed_cams import (
+    DEFAULT_ZED_CAMERA_ID,
+    apply_camera_to_init_params,
+)
 from robo_utils.conversion_utils import (
     gripper_tip_from_ee_pose,
     rotate_pose_about_world_axis_at_point,
@@ -407,12 +411,15 @@ class LiveZedWmRecorder:
         init_params.depth_mode = getattr(sl.DEPTH_MODE, self.args.zed_depth_mode)
         init_params.coordinate_units = sl.UNIT.METER
         init_params.coordinate_system = sl.COORDINATE_SYSTEM.IMAGE
-        init_params.set_from_camera_id(int(self.args.zed_camera_id))
+        camera_id = int(self.args.zed_camera_id)
+        serial = apply_camera_to_init_params(init_params, camera_id)
 
         self.zed = sl.Camera()
         status = self.zed.open(init_params)
         if status != sl.ERROR_CODE.SUCCESS:
-            raise RuntimeError(f"Failed to open ZED camera {self.args.zed_camera_id}: {status}")
+            raise RuntimeError(
+                f"Failed to open ZED camera id={camera_id} serial={serial}: {status}"
+            )
 
         self.runtime_params = sl.RuntimeParameters()
         self.image_mat = sl.Mat()
@@ -1077,7 +1084,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--episode-dir", default=None, help="Directory for collected WM episode .npz files.")
     parser.add_argument("--episode-id", default=None, help="Episode file stem. Defaults to --plan-id, otherwise the plan file stem. Not allowed with --all-plans.")
-    parser.add_argument("--zed-camera-id", type=int, default=1)
+    parser.add_argument(
+        "--zed-camera-id",
+        type=int,
+        default=DEFAULT_ZED_CAMERA_ID,
+        help="Logical ZED camera id (stable across reboots via serial mapping in zed_cams).",
+    )
     parser.add_argument("--zed-resolution", choices=("HD2K", "HD1200", "HD1080", "HD720", "VGA"), default="HD720")
     parser.add_argument("--zed-fps", type=int, default=30)
     parser.add_argument(
