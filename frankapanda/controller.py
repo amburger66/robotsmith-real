@@ -40,6 +40,8 @@ class FrankaPandaController:
 
         self.open_gripper_action = OPEN
         self.close_gripper_action = CLOSED
+        # Latched commanded gripper for arm motion (see get_motion_gripper_state).
+        self._commanded_gripper: float | None = None
 
     def check_joint_position_violation(self):
 
@@ -80,15 +82,37 @@ class FrankaPandaController:
             # print("Waiting for robot gripper pose...")
 
     def get_gripper_state(self) -> int:
+        """Measured gripper state from finger width (can read 'open' on deformable objects)."""
         gripper_width = self.robot_interface.last_gripper_q
         if gripper_width is None:
             return OPEN if self.robot_interface.last_gripper_action < 0.0 else CLOSED
         return OPEN if float(gripper_width) >= FRANKA_GRIPPER_OPEN_THRESHOLD_M else CLOSED
 
+    def _infer_gripper_from_last_command(self) -> float:
+        if self.robot_interface.last_gripper_action < 0.0:
+            return self.open_gripper_action
+        return self.close_gripper_action
+
+    def get_motion_gripper_state(self) -> float:
+        """Gripper command to stream during arm motion.
+
+        Uses the latched value set by open_gripper/close_gripper/set_commanded_gripper.
+        Before any latch, falls back to the last deoxys gripper command (not finger width),
+        so soft objects that keep a large measured gap do not trigger reopen during lift.
+        """
+        if self._commanded_gripper is not None:
+            return self._commanded_gripper
+        return self._infer_gripper_from_last_command()
+
+    def set_commanded_gripper(self, gripper_state: float) -> None:
+        self._commanded_gripper = float(gripper_state)
+
     def open_gripper(self, num_steps: int = 10):
+        self._commanded_gripper = self.open_gripper_action
         self._command_gripper(self.open_gripper_action, num_steps)
 
     def close_gripper(self, num_steps: int = 10):
+        self._commanded_gripper = self.close_gripper_action
         self._command_gripper(self.close_gripper_action, num_steps)
 
     def _command_gripper(self, gripper_action: float, num_steps: int = 10):

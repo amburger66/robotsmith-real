@@ -2,6 +2,8 @@
 
 The VLM plan is expected to contain waypoints of the form:
     [x_norm, y_norm, dx, dy, dz, gripper_action]
+or the string action token:
+    "pour"
 
 The normalized image coordinates are interpreted on the 256x256 image produced
 by scripts/visualization_scripts/crop_resize_zed.py. This script recreates the
@@ -34,27 +36,40 @@ for path in (ROBOTSMITH_ROOT, ROBOTSMITH_ROOT / "robo_utils"):
         sys.path.insert(0, path_str)
 
 from frankapanda.motionplanner import EE_LINK_CENTER_TO_GRIPPER_TIP
+from robo_utils.conversion_utils import (
+    gripper_tip_from_ee_pose,
+    rotate_pose_about_world_axis_at_point,
+)
 
 
 TASK_TO_TOOL = {
     "task08_cutting": "cutter",
     "task03_flatten": "paddle",
+    "task_pour": "cup",
+    "task00_ball": "tool",
 }
-DEFAULT_TASK_NAME = "task08_cutting"
+DEFAULT_TASK_NAME = "task00_ball"
 DEFAULT_EXTRINSICS = DATA_ROOT / "calibration/eye_to_hand/cam0_calibration.npz"
 ZED_CAPTURE_DIR = {
-    "task08_cutting": "data/zed_captures/zed1_20260515_131532",
+    "task08_cutting": "data/zed_captures/zed1_20260517_100306",
     "task03_flatten": "data/zed_captures/zed1_20260516_170417",
+    "task_pour": "data/zed_captures/zed1_20260520_175143",
+    "task00_ball": "data/zed_captures/zed0_20260521_111058",
 }
 
 DEFAULT_CROP = (380, 1000, 0, 620)
 TASK_DEFAULT_GRIPPER_QUAT_WXYZ = {
     "task08_cutting": np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32),
     "task03_flatten": np.array([0.0, 0.70710678, -0.70710678, 0.0], dtype=np.float32),
+    "task_pour": np.array([0.5,-0.5,0.5,0.5], dtype=np.float32),
+    "task00_ball": np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32),
 }
 
 GRIPPER_CLOSE = 0
 GRIPPER_OPEN = 1
+GRIPPER_UNCHANGED = -1
+POUR_ACTION = "pour"
+WORLD_MINUS_X_AXIS = np.array([-1.0, 0.0, 0.0], dtype=np.float64)
 
 
 @dataclass
@@ -73,6 +88,10 @@ class TargetRecord:
     z_clipped_for_grip: bool = False
     error: str | None = None
     planning_success: bool | None = None
+    kind: str = "waypoint"
+    pour_poses_wxyz: list[list[float]] | None = None
+    planned_trajectories: list | None = None
+    pour_tilt_segment_count: int = 0
 
 
 def resolve_path(path: str | os.PathLike, *, base: Path = WORKSPACE_ROOT) -> Path:
@@ -125,17 +144,40 @@ def parse_quat(raw: str) -> np.ndarray:
     return quat / norm
 
 
-def load_plan(plan_file: Path) -> list[list[float]]:
+def load_plan(plan_file: Path) -> list[list[float] | str]:
     with plan_file.open("r") as f:
         plan = json.load(f)
     if not isinstance(plan, list):
         raise ValueError(f"Expected top-level list in plan file, got {type(plan).__name__}")
     for i, waypoint in enumerate(plan):
+        if waypoint == POUR_ACTION:
+            continue
         if not isinstance(waypoint, list) or len(waypoint) != 6:
             raise ValueError(
-                f"Waypoint {i} must be [x_norm, y_norm, dx, dy, dz, gripper], got {waypoint!r}"
+                f"Waypoint {i} must be [x_norm, y_norm, dx, dy, dz, gripper] or {POUR_ACTION!r}, got {waypoint!r}"
             )
     return plan
+
+
+def parse_pour_intermediate_deg(raw: str) -> list[float]:
+    if not raw.strip():
+        return []
+    return [float(v.strip()) for v in raw.split(",") if v.strip()]
+
+
+def pour_tilt_angles(args: argparse.Namespace) -> list[float]:
+    intermediates = [a for a in args.pour_intermediate_deg if 0.0 < a < args.pour_tilt_deg]
+    return sorted(set(intermediates + [float(args.pour_tilt_deg)]))
+
+
+def ee_pose_at_pour_tilt(start_pose: np.ndarray, pivot: np.ndarray, tilt_deg: float) -> np.ndarray:
+    return rotate_pose_about_world_axis_at_point(
+        start_pose,
+        WORLD_MINUS_X_AXIS,
+        np.deg2rad(tilt_deg),
+        pivot,
+        format="wxyz",
+    )
 
 
 def resolve_scene_dir(args: argparse.Namespace) -> Path:
@@ -162,8 +204,30 @@ def resolve_plan_files(args: argparse.Namespace) -> list[Path]:
         plan_files = sorted(p / "initial_0_robot.json" for p in scene_dir.iterdir() if (p / "initial_0_robot.json").is_file())
         if not plan_files:
             raise FileNotFoundError(f"No initial_0_robot.json plans found under: {scene_dir}")
+        if args.start_plan_id is not None:
+            start_idx = find_start_plan_index(plan_files, args.start_plan_id)
+            plan_files = plan_files[start_idx:]
         return plan_files
+    if args.start_plan_id is not None:
+        raise ValueError("--start-plan-id can only be used with --all-plans")
     return [resolve_plan_file(args)]
+
+
+def find_start_plan_index(plan_files: list[Path], start_plan_id: str) -> int:
+    start = str(start_plan_id)
+    for i, plan_file in enumerate(plan_files):
+        if plan_file.parent.name == start:
+            return i
+
+    if start.isdigit():
+        start_num = int(start)
+        for i, plan_file in enumerate(plan_files):
+            name = plan_file.parent.name
+            if name.isdigit() and int(name) == start_num:
+                return i
+
+    available = ", ".join(plan_file.parent.name for plan_file in plan_files)
+    raise ValueError(f"--start-plan-id {start_plan_id!r} did not match any plan folder. Available plans: {available}")
 
 
 def prompt_continue_to_next_plan(next_plan_file: Path) -> bool:
@@ -239,7 +303,7 @@ def crop_resize_zed_capture(capture_dir: Path, crop: tuple[int, int, int, int], 
         raise ValueError(f"Invalid crop {crop}; expected x1>x0 and y1>y0")
 
     rgb = np.load(capture_dir / "rgb.npy")
-    depth = np.load(capture_dir / "depth_m.npy")
+    depth = np.load(capture_dir / "initial_depth.npy")
     xyz = np.load(capture_dir / "xyz_m.npy")
     intr_raw = dict(np.load(capture_dir / "camera_intrinsics.npz"))
 
@@ -418,7 +482,7 @@ class LiveZedWmRecorder:
 
 
 def build_targets(
-    plan: list[list[float]],
+    plan: list[list[float] | str],
     depth: np.ndarray,
     xyz: np.ndarray,
     intr: dict[str, float],
@@ -430,8 +494,35 @@ def build_targets(
     targets: list[TargetRecord] = []
     gripping_tool = False
     grip_z_floor_m: float | None = None
+    last_valid_pose: np.ndarray | None = None
 
     for i, waypoint in enumerate(plan):
+        if waypoint == POUR_ACTION:
+            pour_poses_wxyz = None
+            if last_valid_pose is not None:
+                ref_pose = np.asarray(last_valid_pose, dtype=np.float64)
+                pivot = gripper_tip_from_ee_pose(ref_pose, EE_LINK_CENTER_TO_GRIPPER_TIP)
+                tilt_pose = ee_pose_at_pour_tilt(ref_pose, pivot, float(args.pour_tilt_deg))
+                pour_poses_wxyz = [ref_pose.tolist(), tilt_pose.tolist()]
+            targets.append(
+                TargetRecord(
+                    index=i,
+                    source_pixel=[-1, -1],
+                    normalized_xy=[0.0, 0.0],
+                    offset_robot_m=[0.0, 0.0, 0.0],
+                    camera_point_m=None,
+                    base_anchor_m=None,
+                    target_position_m=None,
+                    target_pose_wxyz=None,
+                    gripper_action=GRIPPER_UNCHANGED,
+                    used_fallback_backprojection=False,
+                    valid=True,
+                    kind="pour",
+                    pour_poses_wxyz=pour_poses_wxyz,
+                )
+            )
+            continue
+
         x_norm, y_norm, dx, dy, dz, gripper_action = waypoint
         u = int(np.clip(round(float(x_norm) * (W - 1)), 0, W - 1))
         v = int(np.clip(round(float(y_norm) * (H - 1)), 0, H - 1))
@@ -495,6 +586,7 @@ def build_targets(
             target_position[2] = clipped_z
 
         pose = np.concatenate([target_position, gripper_quat.astype(np.float64)])
+        last_valid_pose = pose
         targets.append(
             TargetRecord(
                 index=i,
@@ -510,12 +602,13 @@ def build_targets(
                 z_clipped_for_grip=z_clipped,
                 valid=True,
                 error=None,
+                kind="waypoint",
             )
         )
 
         if action == GRIPPER_CLOSE and not gripping_tool:
             gripping_tool = True
-            grip_z_floor_m = float(target_position[2])
+            grip_z_floor_m = float(target_position[2]) - 0.02  # to account for the holder height
             print("setting grip_z_floor_m to ", grip_z_floor_m)
         elif action == GRIPPER_OPEN:
             gripping_tool = False
@@ -637,10 +730,20 @@ def target_visual_points(targets: list[TargetRecord]) -> tuple[np.ndarray, np.nd
     all_colors = []
 
     for target in targets:
-        if not target.valid or target.target_pose_wxyz is None:
+        if not target.valid:
+            continue
+        color = palette[target.index % len(palette)]
+        if target.kind == "pour" and target.pour_poses_wxyz:
+            for j, pose_list in enumerate(target.pour_poses_wxyz):
+                pose = np.asarray(pose_list, dtype=np.float64)
+                subcolor = color * (0.55 if j else 1.0)
+                pts = np.vstack([target_marker_points(pose[:3]), gripper_glyph_points(pose)])
+                all_points.append(pts)
+                all_colors.append(np.tile(subcolor[None, :], (len(pts), 1)))
+            continue
+        if target.target_pose_wxyz is None:
             continue
         pose = np.asarray(target.target_pose_wxyz, dtype=np.float64)
-        color = palette[target.index % len(palette)]
         pts = np.vstack([target_marker_points(pose[:3]), gripper_glyph_points(pose)])
         all_points.append(pts)
         all_colors.append(np.tile(color[None, :], (len(pts), 1)))
@@ -712,10 +815,66 @@ def save_records_json(
         "ee_link_center_to_gripper_tip": float(EE_LINK_CENTER_TO_GRIPPER_TIP),
         "ignore_xyz_offsets": bool(args.ignore_xyz_offsets),
         "anchor_points_only": bool(args.anchor_points_only),
-        "targets": [asdict(t) for t in targets],
+        "targets": [target_record_to_dict(t) for t in targets],
     }
     with path.open("w") as f:
         json.dump(payload, f, indent=2)
+
+
+def target_record_to_dict(target: TargetRecord) -> dict:
+    data = asdict(target)
+    data.pop("planned_trajectories", None)
+    return data
+
+
+def plan_pour_motion(
+    motion_planner,
+    current_joints,
+    args: argparse.Namespace,
+) -> tuple[list[np.ndarray], bool, int]:
+    """Plan tilt-up, hold-at-tilt, and return trajectories for a pour action."""
+    import torch
+    from curobo.wrap.reacher.motion_gen import MotionGenPlanConfig
+
+    start_pose = motion_planner.fk(current_joints).detach().cpu().numpy()
+    if start_pose.ndim > 1:
+        start_pose = start_pose[0]
+    start_pose = np.asarray(start_pose, dtype=np.float64)
+    pivot = gripper_tip_from_ee_pose(start_pose, EE_LINK_CENTER_TO_GRIPPER_TIP)
+
+    tilt_angles = pour_tilt_angles(args)
+    return_angles = list(reversed(tilt_angles[:-1]))
+    angle_sequence = tilt_angles + return_angles + [0.0]
+
+    trajectories: list[np.ndarray] = []
+    n_tilt_segments = len(tilt_angles)
+    joints = current_joints
+
+    for angle_deg in angle_sequence:
+        if angle_deg == 0.0:
+            goal_pose = start_pose
+        else:
+            goal_pose = ee_pose_at_pour_tilt(start_pose, pivot, angle_deg)
+        goal_tensor = torch.tensor(goal_pose, dtype=torch.float32, device=args.torch_device).unsqueeze(0)
+
+        if args.dry_run and angle_deg == tilt_angles[-1]:
+            motion_planner.visualize_world_and_robot(joints, goal_tensor.squeeze(0))
+
+        traj, success = motion_planner.plan_to_goal_poses(
+            current_joints=joints.unsqueeze(0) if joints.dim() == 1 else joints,
+            goal_poses=goal_tensor,
+            plan_config=MotionGenPlanConfig(max_attempts=100),
+            disable_collision_links=motion_planner.links[-5:],
+        )
+        if not bool(success.item()):
+            print(f"Pour planning failed at tilt angle {angle_deg} deg")
+            return trajectories, False, n_tilt_segments
+
+        segment = traj[0].detach().cpu().numpy()
+        trajectories.append(segment)
+        joints = traj[0, -1].detach()
+
+    return trajectories, True, n_tilt_segments
 
 
 def close_franka_controller(controller) -> None:
@@ -753,10 +912,33 @@ def plan_segments(
 
             motion_planner = MotionPlanner(scene_points)
 
-        trajectories = []
         for target in targets:
-            print("Planning target: ", target.index)
-            if not target.valid or target.target_pose_wxyz is None:
+            print("Planning target: ", target.index, f"({target.kind})")
+            if not target.valid:
+                target.planning_success = False
+                continue
+
+            if target.kind == "pour":
+                pour_trajs, pour_ok, n_tilt = plan_pour_motion(
+                    motion_planner,
+                    current_joints,
+                    args,
+                )
+                target.planned_trajectories = pour_trajs
+                target.pour_tilt_segment_count = n_tilt
+                target.planning_success = pour_ok
+                print("Pour planning success: ", pour_ok)
+                if not pour_ok:
+                    break
+                if pour_trajs:
+                    current_joints = torch.tensor(
+                        pour_trajs[-1][-1],
+                        dtype=torch.float32,
+                        device=args.torch_device,
+                    )
+                continue
+
+            if target.target_pose_wxyz is None:
                 target.planning_success = False
                 continue
 
@@ -779,16 +961,21 @@ def plan_segments(
             if not target.planning_success:
                 break
 
-            trajectories.append(traj[0].detach().cpu().numpy())
+            segment = traj[0].detach().cpu().numpy()
+            target.planned_trajectories = [segment]
             current_joints = traj[0, -1].detach()
 
         all_success = all(t.valid and bool(t.planning_success) for t in targets)
         if not all_success:
             failed = [t.index for t in targets if not (t.valid and bool(t.planning_success))]
-            raise RuntimeError(f"Planning failed for target indices: {failed}")
+            message = f"Planning failed for target indices: {failed}"
+            if args.all_plans:
+                print(f"WARNING: {message}; skipping this plan and continuing batch mode.")
+                return
+            raise RuntimeError(message)
 
         if not execute:
-            return trajectories
+            return
 
         recorder = None
         if args.collect_wm_data:
@@ -799,23 +986,36 @@ def plan_segments(
                 recorder.open()
                 recorder.start_episode()
 
-            for target, trajectory in zip(targets, trajectories):
-                assert trajectory is not None
+            import time
+
+            for target in targets:
+                if not target.planned_trajectories:
+                    continue
                 ee_before = controller.get_gripper_pose()[:3].astype(np.float32)
-                current_gripper = controller.close_gripper_action if controller.get_gripper_state() == controller.close_gripper_action else controller.open_gripper_action
-                controller.move_along_trajectory(trajectory, gripper_state=current_gripper)
-                if target.gripper_action == GRIPPER_CLOSE:
-                    controller.close_gripper(num_steps=args.gripper_steps)
-                elif target.gripper_action == GRIPPER_OPEN:
-                    controller.open_gripper(num_steps=args.gripper_steps)
+                current_gripper = controller.get_motion_gripper_state()
+                if target.kind == "pour":
+                    n_tilt = target.pour_tilt_segment_count
+                    for seg_idx, trajectory in enumerate(target.planned_trajectories):
+                        controller.move_along_trajectory(trajectory, gripper_state=current_gripper)
+                        if seg_idx == n_tilt - 1 and args.pour_hold_s > 0.0:
+                            time.sleep(float(args.pour_hold_s))
+                else:
+                    controller.move_along_trajectory(target.planned_trajectories[0], gripper_state=current_gripper)
+                    if target.gripper_action == GRIPPER_CLOSE:
+                        controller.close_gripper(num_steps=args.gripper_steps)
+                    elif target.gripper_action == GRIPPER_OPEN:
+                        controller.open_gripper(num_steps=args.gripper_steps)
                 ee_after = controller.get_gripper_pose()[:3].astype(np.float32)
 
                 if recorder is not None:
                     if args.capture_settle_s > 0.0:
-                        import time
-
                         time.sleep(float(args.capture_settle_s))
-                    recorder.record_step(ee_before, ee_after, target.gripper_action)
+                    gripper_for_record = (
+                        target.gripper_action
+                        if target.gripper_action in (GRIPPER_CLOSE, GRIPPER_OPEN)
+                        else GRIPPER_CLOSE
+                    )
+                    recorder.record_step(ee_before, ee_after, gripper_for_record)
 
             if recorder is not None:
                 episode_path = recorder.save()
@@ -824,10 +1024,11 @@ def plan_segments(
             if args.all_plans:
                 if prompt_reset_home_after_plan():
                     print("Resetting robot to home...")
+                    controller.open_gripper()
                     controller.move_to_joints(controller.home_joints, controller.open_gripper_action)
                     print("Robot is home.")
 
-            return trajectories
+            return
         finally:
             if recorder is not None:
                 recorder.close()
@@ -837,11 +1038,17 @@ def plan_segments(
             close_franka_controller(controller)
 
 
-def print_target_summary(targets: list[TargetRecord]) -> None:
+def print_target_summary(targets: list[TargetRecord], args: argparse.Namespace) -> None:
     print("\nResolved targets:")
     for t in targets:
         if not t.valid:
             print(f"  [{t.index}] INVALID pixel={t.source_pixel} action={t.gripper_action}: {t.error}")
+            continue
+        if t.kind == "pour":
+            print(
+                f"  [{t.index}] POUR tilt={args.pour_tilt_deg}deg "
+                f"hold={args.pour_hold_s}s intermediates={args.pour_intermediate_deg}"
+            )
             continue
         pos = np.asarray(t.target_position_m)
         fallback = ", fallback-depth" if t.used_fallback_backprojection else ""
@@ -860,6 +1067,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plan-id", default=None)
     parser.add_argument("--plan-file", default=None)
     parser.add_argument("--all-plans", action="store_true", help="Run every <plan-id>/initial_0_robot.json under the selected scene directory, pausing between plans.")
+    parser.add_argument("--start-plan-id", "--start-plan-number", dest="start_plan_id", default=None, help="Batch mode only: start at this plan folder and run the rest. Accepts zero-padded IDs like 009 or numbers like 9.")
     parser.add_argument("--extrinsics", default=str(DEFAULT_EXTRINSICS))
     parser.add_argument(
         "--collect-wm-data",
@@ -907,6 +1115,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--home-first", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--gripper-steps", type=int, default=80)
     parser.add_argument("--torch-device", default="cuda:0")
+    parser.add_argument("--pour-tilt-deg", type=float, default=90.0, help="Pour tilt angle about world -X (degrees).")
+    parser.add_argument("--pour-hold-s", type=float, default=1.0, help="Seconds to hold at full pour tilt.")
+    parser.add_argument(
+        "--pour-intermediate-deg",
+        type=parse_pour_intermediate_deg,
+        default="30,60",
+        help="Comma-separated intermediate tilt angles before the final tilt (empty for none).",
+    )
     return parser.parse_args()
 
 
@@ -965,7 +1181,7 @@ def run_one_plan(
         )
     T_cam_to_base = load_extrinsics_matrix(extrinsics)
     targets = build_targets(plan, depth_256, xyz_256, intr, T_cam_to_base, args.gripper_quat, args)
-    print_target_summary(targets)
+    print_target_summary(targets, args)
 
     scene_points, scene_colors = make_scene_pointcloud(
         xyz_256,
