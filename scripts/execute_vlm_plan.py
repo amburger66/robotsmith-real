@@ -51,14 +51,17 @@ TASK_TO_TOOL = {
     "task03_flatten": "paddle",
     "task_pour": "cup",
     "task00_ball": "tool",
+    "task02_reaching": "reacher",
 }
-DEFAULT_TASK_NAME = "task00_ball"
-DEFAULT_EXTRINSICS = DATA_ROOT / "calibration/eye_to_hand/cam0_calibration.npz"
+DEFAULT_TASK_NAME = "task02_reaching"
+# DEFAULT_EXTRINSICS = DATA_ROOT / "calibration/eye_to_hand/cam0_calibration.npz" For camera 0
+DEFAULT_EXTRINSICS = DATA_ROOT / "calibration/eye_to_hand/cam3_calibration.npz"
 ZED_CAPTURE_DIR = {
     "task08_cutting": "data/zed_captures/zed1_20260517_100306",
     "task03_flatten": "data/zed_captures/zed1_20260516_170417",
     "task_pour": "data/zed_captures/zed1_20260520_175143",
     "task00_ball": "data/zed_captures/zed0_20260521_111058",
+    "task02_reaching": "data/zed_captures/zed2_20260522_135234",
 }
 
 DEFAULT_CROP = (380, 1000, 0, 620)
@@ -67,6 +70,7 @@ TASK_DEFAULT_GRIPPER_QUAT_WXYZ = {
     "task03_flatten": np.array([0.0, 0.70710678, -0.70710678, 0.0], dtype=np.float32),
     "task_pour": np.array([0.5,-0.5,0.5,0.5], dtype=np.float32),
     "task00_ball": np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32),
+    "task02_reaching": np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32),
 }
 
 GRIPPER_CLOSE = 0
@@ -167,6 +171,18 @@ def parse_pour_intermediate_deg(raw: str) -> list[float]:
     if not raw.strip():
         return []
     return [float(v.strip()) for v in raw.split(",") if v.strip()]
+
+
+def parse_camera_ids(raw: str) -> tuple[int, ...]:
+    try:
+        camera_ids = tuple(int(v.strip()) for v in raw.split(",") if v.strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--wm-camera-ids must be comma-separated integers") from exc
+    if not camera_ids:
+        raise argparse.ArgumentTypeError("--wm-camera-ids must contain at least one camera id")
+    if len(set(camera_ids)) != len(camera_ids):
+        raise argparse.ArgumentTypeError("--wm-camera-ids cannot contain duplicate camera ids")
+    return camera_ids
 
 
 def pour_tilt_angles(args: argparse.Namespace) -> list[float]:
@@ -379,13 +395,14 @@ class LiveZedWmRecorder:
         self.T_base_to_camera = np.linalg.inv(np.asarray(T_cam_to_base, dtype=np.float64))
         self.episode_dir = episode_dir
         self.episode_id = episode_id
+        self.camera_ids = tuple(getattr(args, "wm_camera_ids", (args.zed_camera_id,)))
         self.states: list[np.ndarray] = []
         self.positions: list[np.ndarray] = []
         self.grippers: list[float] = []
-        self.zed = None
-        self.runtime_params = None
-        self.image_mat = None
-        self.intrinsics: np.ndarray | None = None
+        self.zeds = {}
+        self.runtime_params = {}
+        self.image_mats = {}
+        self.intrinsics_by_camera: list[np.ndarray] = []
 
     def __enter__(self):
         self.open()
@@ -405,66 +422,85 @@ class LiveZedWmRecorder:
             "HD720": sl.RESOLUTION.HD720,
             "VGA": sl.RESOLUTION.VGA,
         }
-        init_params = sl.InitParameters()
-        init_params.camera_resolution = resolution_map[self.args.zed_resolution]
-        init_params.camera_fps = int(self.args.zed_fps)
-        init_params.depth_mode = getattr(sl.DEPTH_MODE, self.args.zed_depth_mode)
-        init_params.coordinate_units = sl.UNIT.METER
-        init_params.coordinate_system = sl.COORDINATE_SYSTEM.IMAGE
-        camera_id = int(self.args.zed_camera_id)
-        serial = apply_camera_to_init_params(init_params, camera_id)
+        if self.zeds:
+            return
 
-        self.zed = sl.Camera()
-        status = self.zed.open(init_params)
-        if status != sl.ERROR_CODE.SUCCESS:
-            raise RuntimeError(
-                f"Failed to open ZED camera id={camera_id} serial={serial}: {status}"
-            )
+        try:
+            for camera_id in self.camera_ids:
+                init_params = sl.InitParameters()
+                init_params.camera_resolution = resolution_map[self.args.zed_resolution]
+                init_params.camera_fps = int(self.args.zed_fps)
+                init_params.depth_mode = getattr(sl.DEPTH_MODE, self.args.zed_depth_mode)
+                init_params.coordinate_units = sl.UNIT.METER
+                init_params.coordinate_system = sl.COORDINATE_SYSTEM.IMAGE
+                serial = apply_camera_to_init_params(init_params, int(camera_id))
 
-        self.runtime_params = sl.RuntimeParameters()
-        self.image_mat = sl.Mat()
-        for _ in range(max(0, int(self.args.zed_warmup_frames))):
-            self.zed.grab(self.runtime_params)
+                zed = sl.Camera()
+                status = zed.open(init_params)
+                if status != sl.ERROR_CODE.SUCCESS:
+                    raise RuntimeError(
+                        f"Failed to open ZED camera id={camera_id} serial={serial}: {status}"
+                    )
 
-        cam_info = self.zed.get_camera_information()
-        left = cam_info.camera_configuration.calibration_parameters.left_cam
-        intr_raw = {
-            "fx": left.fx,
-            "fy": left.fy,
-            "cx": left.cx,
-            "cy": left.cy,
-        }
-        resized_intr = resize_intrinsics(intr_raw, self.crop, self.size)
-        self.intrinsics = intrinsics_dict_to_matrix(resized_intr)
+                runtime_params = sl.RuntimeParameters()
+                image_mat = sl.Mat()
+                for _ in range(max(0, int(self.args.zed_warmup_frames))):
+                    zed.grab(runtime_params)
+
+                cam_info = zed.get_camera_information()
+                left = cam_info.camera_configuration.calibration_parameters.left_cam
+                intr_raw = {
+                    "fx": left.fx,
+                    "fy": left.fy,
+                    "cx": left.cx,
+                    "cy": left.cy,
+                }
+                resized_intr = resize_intrinsics(intr_raw, self.crop, self.size)
+                self.intrinsics_by_camera.append(intrinsics_dict_to_matrix(resized_intr))
+                self.zeds[int(camera_id)] = zed
+                self.runtime_params[int(camera_id)] = runtime_params
+                self.image_mats[int(camera_id)] = image_mat
+        except Exception:
+            self.close()
+            raise
 
     def close(self) -> None:
-        if self.zed is not None:
-            self.zed.close()
-            self.zed = None
+        for zed in self.zeds.values():
+            zed.close()
+        self.zeds.clear()
+        self.runtime_params.clear()
+        self.image_mats.clear()
 
-    def capture_rgb(self) -> np.ndarray:
+    def capture_rgb(self, camera_id: int) -> np.ndarray:
         import pyzed.sl as sl
 
-        if self.zed is None or self.runtime_params is None or self.image_mat is None:
-            raise RuntimeError("ZED recorder is not open")
-        status = self.zed.grab(self.runtime_params)
+        if camera_id not in self.zeds:
+            raise RuntimeError(f"ZED recorder camera {camera_id} is not open")
+        zed = self.zeds[camera_id]
+        runtime_params = self.runtime_params[camera_id]
+        image_mat = self.image_mats[camera_id]
+        status = zed.grab(runtime_params)
         if status != sl.ERROR_CODE.SUCCESS:
-            raise RuntimeError(f"Failed to grab ZED frame for WM data: {status}")
-        self.zed.retrieve_image(self.image_mat, sl.VIEW.LEFT)
-        bgra = np.array(self.image_mat.get_data())
+            raise RuntimeError(f"Failed to grab ZED frame for WM data from camera {camera_id}: {status}")
+        zed.retrieve_image(image_mat, sl.VIEW.LEFT)
+        bgra = np.array(image_mat.get_data())
         rgb = np.ascontiguousarray(bgra[..., [2, 1, 0]])
         return crop_resize_rgb_array(rgb, self.crop, self.size)
 
+    def capture_rgbs(self) -> np.ndarray:
+        frames = [self.capture_rgb(camera_id) for camera_id in self.camera_ids]
+        return np.stack(frames, axis=0)
+
     def start_episode(self) -> None:
-        self.states.append(self.capture_rgb())
+        self.states.append(self.capture_rgbs())
 
     def record_step(self, ee_before: np.ndarray, ee_after: np.ndarray, gripper_action: int) -> None:
         self.positions.append(np.stack([ee_before, ee_after], axis=0).astype(np.float32))
         self.grippers.append(float(gripper_action))
-        self.states.append(self.capture_rgb())
+        self.states.append(self.capture_rgbs())
 
     def save(self) -> Path:
-        if self.intrinsics is None:
+        if len(self.intrinsics_by_camera) != len(self.camera_ids):
             raise RuntimeError("Cannot save WM episode before opening ZED recorder")
         if len(self.states) - 1 != len(self.positions) or len(self.positions) != len(self.grippers):
             raise RuntimeError(
@@ -474,19 +510,29 @@ class LiveZedWmRecorder:
         self.episode_dir.mkdir(parents=True, exist_ok=True)
         path = self.episode_dir / f"{self.episode_id}.npz"
         positions = np.asarray(self.positions, dtype=np.float32)
+        states_by_camera = np.asarray(self.states, dtype=np.uint8)
+        primary_states = states_by_camera[:, 0]
+        intrinsics_by_camera = np.asarray(self.intrinsics_by_camera, dtype=np.float32)
+        camera_state_arrays = {
+            f"states_cam{camera_id}": states_by_camera[:, i]
+            for i, camera_id in enumerate(self.camera_ids)
+        }
         np.savez(
             path,
-            states=np.asarray(self.states, dtype=np.uint8),
+            states=primary_states,
+            states_by_camera=states_by_camera,
+            camera_ids=np.asarray(self.camera_ids, dtype=np.int32),
             positions=positions,
             valid_mask=np.ones(positions.shape[:2], dtype=bool),
             grippers=np.asarray(self.grippers, dtype=np.float32),
             penalty=np.asarray([0.0, 0.0], dtype=np.float32),
             metric=np.asarray(0.0, dtype=np.float32),
-            intrinsics=self.intrinsics,
+            intrinsics=intrinsics_by_camera[0],
+            intrinsics_by_camera=intrinsics_by_camera,
             extrinsics=self.T_base_to_camera,
+            **camera_state_arrays,
         )
         return path
-
 
 def build_targets(
     plan: list[list[float] | str],
@@ -1089,6 +1135,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_ZED_CAMERA_ID,
         help="Logical ZED camera id (stable across reboots via serial mapping in zed_cams).",
+    )
+    parser.add_argument(
+        "--wm-camera-ids",
+        type=parse_camera_ids,
+        default=(0, 2),
+        help="Comma-separated logical ZED ids to record into WM episode NPZ files (default: 0,2).",
     )
     parser.add_argument("--zed-resolution", choices=("HD2K", "HD1200", "HD1080", "HD720", "VGA"), default="HD720")
     parser.add_argument("--zed-fps", type=int, default=30)

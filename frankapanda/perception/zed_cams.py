@@ -10,11 +10,11 @@ import pyzed.sl as sl
 
 class ZedCams:
     # cam 0, 1: eye-to-hand fixed ZED 2i cameras in this lab.
-    # cam 2:    wrist-mounted ZED Mini, used for eye-in-hand calibration.
+    # cam 2:    connected ZED 2 camera.
     id2serial = {
         0: 34858067,
         1: 31240214,
-        2: 14636260,
+        2: 25520209,
     }
 
 
